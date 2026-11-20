@@ -2,14 +2,20 @@
 
 Two kinds of people build a good EMR, and most projects only have one of them.
 
-## Getting started (Milestone 0)
-The skeleton is in: `cargo run` starts an `axum` server exposing a FHIR `Patient` over a `ChartStore` trait, with a passing roundtrip test (`cargo test`). It's deliberately tiny. The first real issues, each a clean first commit:
-1. **A SQLite `ChartStore` impl** (today's store is in-memory — this is issue #1). JSONB-style payload + promoted `id` column.
-2. A `DocumentReference` (a clinical note) with a `Provenance` record on write.
-3. An `AuditEvent` on read.
-4. A `/metadata` FHIR CapabilityStatement.
+## Getting started
 
-Pick one, open an issue claiming it before you start so two people don't build it twice, and you've moved the project from manifesto to software.
+Milestone 0 (the `Patient`-only skeleton) and Milestone 1 (below) are in. `cargo run` starts an `axum` server; `cargo test` passes.
+
+### Milestone 1 (done)
+A SQLite-backed `ChartStore` (bundled `rusqlite`, in-memory for tests), generic FHIR CRUD over the US Core types `Patient`, `Condition`, `MedicationRequest`, `AllergyIntolerance`, `Observation`, `DocumentReference` (`POST /:type`, `GET`/`PUT /:type/:id`), a governance spine — a `Provenance` written on every create/update and an append-only `AuditEvent` on every read — and a `GET /metadata` CapabilityStatement. `InMemoryStore` remains alongside `SqliteStore`; both implement the trait.
+
+### Open next
+1. `Encounter` + linking resources to a patient/encounter.
+2. Promoted columns + indexes on the SQLite payload (search by patient/code/date), then the Postgres backend.
+3. Auth, and real `Provenance` signing (today's signer is a fixed demo label).
+4. A one-line coded-charge / superbill export.
+
+Pick one, open an issue claiming it before you start so two people don't build it twice, and you've moved the project further from manifesto to software.
 
 ## If you write code
 - Rust, FHIR, web front end, DevOps, security — all welcome.

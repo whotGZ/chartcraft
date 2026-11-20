@@ -1,3 +1,5 @@
 /target
 Cargo.lock
 goldfish_review_report.md
+/chartcraft.db
+/chartcraft.db-*

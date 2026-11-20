@@ -1,6 +1,17 @@
 # ChartCraft — Architecture concept
 
-This is a concept, written to be argued with. Nothing here is built yet.
+This is a concept, written to be argued with. Most of it is not built yet.
+
+## Milestone 1 (done)
+
+The storage seam and governance spine from this document now exist in code:
+
+- **SQLite `ChartStore`** (bundled `rusqlite`, so no system SQLite needed) alongside the in-memory one — the two honest backends described under *Stack*. A single `resources(resource_type, id, version, payload)` table; a `Mutex<Connection>` guards writes (a global lock for now, to be replaced by a pool).
+- **Generic FHIR CRUD** over the US Core types in the MVP table below: `POST /:type` (server-assigned uuid), `GET`/`PUT /:type/:id`, with light validation (body `resourceType` must match the path; unknown types are rejected `400` with an `OperationOutcome`).
+- **Governance spine:** a `Provenance` written on every create/update and an append-only `AuditEvent` on every read, both persisted through the same store. Signing is a fixed demo label until auth lands; the hash-chained tamper-evidence described below is not built yet.
+- **`GET /metadata`** returns a minimal FHIR R4 `CapabilityStatement`.
+
+Not yet built: promoted columns/indexes, the Postgres backend, auth, real signing, and everything under *AI, done responsibly*.
 
 ## The one idea
 
