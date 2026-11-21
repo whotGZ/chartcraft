@@ -75,6 +75,145 @@ function ageFrom(birthDate) {
 
 function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
 
+/* ---------- UTF-8-safe base64 ---------- */
+function encodeNote(text) {
+  const bytes = new TextEncoder().encode(text || "");
+  let bin = "";
+  // chunk to avoid blowing the call stack on long notes
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+function decodeNote(data) {
+  if (!data) return "";
+  try {
+    const bin = atob(data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  } catch (_e) {
+    // not valid base64 — fall back to the raw string rather than crashing
+    return typeof data === "string" ? data : "";
+  }
+}
+
+function fmtDateTime(d) {
+  if (!d) return null;
+  const dt = new Date(d);
+  if (isNaN(dt)) return fmtDate(d) || d;
+  // build the date from LOCAL components so a late-evening save doesn't show tomorrow
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const date = `${months[dt.getMonth()]} ${dt.getDate()}, ${dt.getFullYear()}`;
+  let h = dt.getHours();
+  const min = String(dt.getMinutes()).padStart(2, "0");
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${date}, ${h}:${min} ${ap}`;
+}
+
+/* ---------- note skeletons ---------- */
+const SIGNING_CLINICIAN = "Dr. (signing clinician)";
+
+function settingLine(setting) {
+  if (setting === "ICU") return "Setting: Intensive Care Unit";
+  if (setting === "Skilled nursing facility") return "Setting: Skilled Nursing Facility";
+  return "Setting: Outpatient Clinic";
+}
+
+function noteSkeleton(type, setting) {
+  const hdr = `${type}  —  ${setting === "ICU" ? "Intensive Care Unit"
+    : setting === "Skilled nursing facility" ? "Skilled Nursing Facility"
+    : "Outpatient Clinic"}\n${"=".repeat(52)}\n\n`;
+
+  if (type === "H&P") {
+    const courseHint = setting === "ICU"
+      ? "(reason for ICU admission, acuity, lines/drips, ventilation)"
+      : setting === "Skilled nursing facility"
+      ? "(reason for SNF admission, prior level of care, goals)"
+      : "(reason for today's visit)";
+    return hdr +
+`CHIEF COMPLAINT:
+\t${courseHint}
+
+HISTORY OF PRESENT ILLNESS:
+\t
+
+PAST MEDICAL / SURGICAL HISTORY:
+\t
+
+MEDICATIONS:
+\t
+
+ALLERGIES:
+\t
+
+REVIEW OF SYSTEMS:
+\t
+
+PHYSICAL EXAM:
+\tVitals:
+\tGeneral:
+${setting === "ICU" ? "\tLines/Devices: \n\tVentilator/O2: \n" : ""}
+ASSESSMENT & PLAN:
+\t1.
+\t2.
+
+${settingLine(setting)}
+`;
+  }
+
+  if (type === "Discharge summary") {
+    const course = setting === "ICU"
+      ? "HOSPITAL COURSE (ICU):\n\t(critical illness course, major events, de-escalation)"
+      : setting === "Skilled nursing facility"
+      ? "FACILITY COURSE:\n\t(therapy progress, functional status, response to treatment)"
+      : "COURSE:\n\t(interval course since last visit)";
+    return hdr +
+`ADMISSION DIAGNOSIS:
+\t
+
+DISCHARGE DIAGNOSIS:
+\t
+
+${course}
+
+DISCHARGE MEDICATIONS:
+\t
+
+FOLLOW-UP:
+\t
+
+${settingLine(setting)}
+`;
+  }
+
+  // Progress note (SOAP)
+  const objHint = setting === "ICU"
+    ? "Vitals / hemodynamics: \n\tVent/O2: \n\tDrips: \n\tI/O: \n\tExam: "
+    : setting === "Skilled nursing facility"
+    ? "Vitals: \n\tInterval nursing/therapy notes: \n\tExam: "
+    : "Vitals: \n\tExam: ";
+  return hdr +
+`SUBJECTIVE:
+\t
+
+OBJECTIVE:
+\t${objHint}
+
+ASSESSMENT:
+\t
+
+PLAN:
+\t1.
+\t2.
+
+${settingLine(setting)}
+`;
+}
+
 /* ---------- banner ---------- */
 function showBanner(msg, kind) {
   const b = $("#banner");
@@ -230,19 +369,152 @@ async function selectPatient(id) {
     li.classList.toggle("active", li.dataset.id === id);
   });
 
+  // Reset per-patient transient panels so patient A's note/superbill
+  // never lingers under patient B.
+  resetNotePanels();
+  closeSuperbill();
+
   try {
     const q = `?patient=${encodeURIComponent(id)}`;
-    const [patient, condB, medB, algB, obsB] = await Promise.all([
+    const [patient, condB, medB, algB, obsB, docB] = await Promise.all([
       apiGet("/Patient/" + encodeURIComponent(id)),
       apiGet("/Condition" + q).catch(() => null),
       apiGet("/MedicationRequest" + q).catch(() => null),
       apiGet("/AllergyIntolerance" + q).catch(() => null),
       apiGet("/Observation" + q).catch(() => null),
+      apiGet("/DocumentReference" + q).catch(() => null),
     ]);
     hideBanner();
     renderChart(patient, entries(condB), entries(medB), entries(algB), entries(obsB));
+    renderNotes(entries(docB));
   } catch (err) {
     showBanner("Could not load this patient's chart. " + err.message, "err");
+  }
+}
+
+/* ---------- notes: extraction ---------- */
+function noteType(doc) {
+  return doc?.type?.text
+    || doc?.type?.coding?.[0]?.display
+    || "Note";
+}
+function noteSetting(doc) {
+  return doc?.context?.related?.[0]?.display || null;
+}
+function noteBody(doc) {
+  return decodeNote(doc?.content?.[0]?.attachment?.data);
+}
+function noteAuthor(doc) {
+  return doc?.author?.[0]?.display || null;
+}
+
+/* ---------- notes: rendering ---------- */
+function renderNotes(docs) {
+  // most recent first
+  const sorted = docs.slice().sort((a, b) => String(b?.date || "").localeCompare(String(a?.date || "")));
+  $("#count-notes").textContent = sorted.length;
+
+  const ul = $("#list-notes");
+  ul.innerHTML = "";
+  if (!sorted.length) {
+    ul.appendChild(el("li", "data-empty", "No notes yet. Use “New note” to document a visit."));
+    return;
+  }
+  sorted.forEach((doc) => {
+    const li = el("li", "data-item note-item");
+    const left = el("div");
+    left.appendChild(el("div", "di-main", noteType(doc)));
+    const setting = noteSetting(doc);
+    if (setting) left.appendChild(el("div", "di-sub", setting));
+    li.appendChild(left);
+    const when = fmtDateTime(doc?.date);
+    if (when) li.appendChild(el("div", "di-val", when));
+    li.addEventListener("click", () => openNote(doc));
+    ul.appendChild(li);
+  });
+}
+
+function openNote(doc) {
+  const detail = $("#note-detail");
+  $("#note-detail-title").textContent = noteType(doc);
+  const metaBits = [];
+  const setting = noteSetting(doc);
+  if (setting) metaBits.push(setting);
+  const when = fmtDateTime(doc?.date);
+  if (when) metaBits.push(when);
+  const author = noteAuthor(doc);
+  if (author) metaBits.push(author);
+  $("#note-detail-meta").textContent = metaBits.join("  •  ");
+  $("#note-detail-body").textContent = noteBody(doc) || "(empty note)";
+  detail.hidden = false;
+  detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function resetNotePanels() {
+  const ed = $("#note-editor");
+  if (ed) ed.hidden = true;
+  const det = $("#note-detail");
+  if (det) det.hidden = true;
+  const msg = $("#note-save-msg");
+  if (msg) msg.textContent = "";
+}
+
+/* ---------- notes: editor ---------- */
+let lastSkeleton = "";
+function fillSkeleton() {
+  const type = $("#note-type").value;
+  const setting = $("#note-setting").value;
+  lastSkeleton = noteSkeleton(type, setting);
+  $("#note-text").value = lastSkeleton;
+}
+
+function openEditor() {
+  $("#note-detail").hidden = true;
+  $("#note-save-msg").textContent = "";
+  fillSkeleton();
+  const ed = $("#note-editor");
+  ed.hidden = false;
+  ed.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  $("#note-text").focus();
+}
+
+function closeEditor() {
+  $("#note-editor").hidden = true;
+  $("#note-save-msg").textContent = "";
+}
+
+async function saveNote() {
+  if (!selectedId) return;
+  const type = $("#note-type").value;
+  const setting = $("#note-setting").value;
+  const text = $("#note-text").value || "";
+
+  const btn = $("#btn-save-note");
+  btn.disabled = true;
+  $("#note-save-msg").textContent = "Saving…";
+
+  const body = {
+    resourceType: "DocumentReference",
+    status: "current",
+    type: { text: type },
+    subject: { reference: "Patient/" + selectedId },
+    date: new Date().toISOString(),
+    author: [{ display: SIGNING_CLINICIAN }],
+    content: [{ attachment: { contentType: "text/plain", data: encodeNote(text) } }],
+    context: { related: [{ display: setting }] },
+  };
+
+  try {
+    const saved = await apiPost("DocumentReference", body);
+    closeEditor();
+    // refresh the notes list, then show the just-saved note
+    const docB = await apiGet("/DocumentReference?patient=" + encodeURIComponent(selectedId)).catch(() => null);
+    renderNotes(entries(docB));
+    openNote(saved && saved.resourceType ? saved : body);
+  } catch (err) {
+    $("#note-save-msg").textContent = "Could not save: " + err.message;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -337,10 +609,149 @@ async function loadSamplePatient() {
   }
 }
 
+/* ---------- superbill ---------- */
+function closeSuperbill() {
+  const sb = $("#superbill");
+  if (sb) sb.hidden = true;
+  document.body.classList.remove("printing-superbill");
+}
+
+function renderSuperbillError(msg) {
+  const sheet = $("#superbill-sheet");
+  sheet.innerHTML = "";
+  const box = el("div", "superbill-error", msg);
+  sheet.appendChild(box);
+  // hide the Print button when there's nothing to print
+  $("#btn-print-superbill").hidden = true;
+}
+
+function renderSuperbill(data) {
+  const sheet = $("#superbill-sheet");
+  sheet.innerHTML = "";
+  $("#btn-print-superbill").hidden = false;
+
+  const pt = data?.patient || {};
+  const name = pt.name || "Unknown patient";
+  const dob = fmtDate(pt.birthDate);
+
+  // Header
+  const head = el("div", "sb-head");
+  head.appendChild(el("div", "sb-brand", "ChartCraft"));
+  head.appendChild(el("div", "sb-doc-title", "Superbill / Statement of Services"));
+  sheet.appendChild(head);
+
+  const idRow = el("div", "sb-idrow");
+  const mkField = (label, value) => {
+    const f = el("div", "sb-field");
+    f.appendChild(el("span", "sb-field-label", label));
+    f.appendChild(el("span", "sb-field-val", value || "—"));
+    return f;
+  };
+  idRow.appendChild(mkField("Patient", name));
+  idRow.appendChild(mkField("Date of birth", dob || "—"));
+  idRow.appendChild(mkField("Patient ID", pt.id || "—"));
+  idRow.appendChild(mkField("Date of service", fmtDate(data?.date) || data?.date || "—"));
+  sheet.appendChild(idRow);
+
+  // Diagnoses
+  const dxSection = el("div", "sb-section");
+  dxSection.appendChild(el("div", "sb-section-title", "Diagnoses"));
+  const dxList = el("ul", "sb-dx-list");
+  const diagnoses = Array.isArray(data?.diagnoses) ? data.diagnoses : [];
+  if (!diagnoses.length) {
+    dxList.appendChild(el("li", "sb-dx-empty", "No diagnoses recorded."));
+  } else {
+    diagnoses.forEach((d) => {
+      dxList.appendChild(el("li", null, d?.text || "Unspecified diagnosis"));
+    });
+  }
+  dxSection.appendChild(dxList);
+  sheet.appendChild(dxSection);
+
+  // Charge
+  const chSection = el("div", "sb-section");
+  chSection.appendChild(el("div", "sb-section-title", "Charge"));
+  const charge = data?.charge || {};
+  const chargeRow = el("div", "sb-charge");
+  const cpt = el("div", "sb-cpt");
+  cpt.appendChild(el("span", "sb-cpt-label", "CPT"));
+  cpt.appendChild(el("span", "sb-cpt-code", charge.cpt || "—"));
+  chargeRow.appendChild(cpt);
+  chargeRow.appendChild(el("div", "sb-charge-desc", charge.description || "—"));
+  chSection.appendChild(chargeRow);
+  sheet.appendChild(chSection);
+
+  // Explanatory note
+  if (data?.note) {
+    const noteSection = el("div", "sb-section sb-note");
+    noteSection.appendChild(el("div", "sb-section-title", "Note"));
+    noteSection.appendChild(el("div", "sb-note-body", data.note));
+    sheet.appendChild(noteSection);
+  }
+}
+
+async function generateSuperbill() {
+  if (!selectedId) return;
+  const sb = $("#superbill");
+  sb.hidden = false;
+  $("#superbill-sheet").innerHTML = "";
+  $("#btn-print-superbill").hidden = true;
+  const loading = el("div", "superbill-loading", "Generating superbill…");
+  $("#superbill-sheet").appendChild(loading);
+  sb.scrollIntoView({ behavior: "smooth", block: "start" });
+
+  try {
+    // append $superbill raw — encodeURIComponent would turn $ into %24
+    const data = await apiGet("/Patient/" + encodeURIComponent(selectedId) + "/$superbill");
+    renderSuperbill(data);
+  } catch (err) {
+    const notFound = /→\s*404/.test(err.message);
+    renderSuperbillError(
+      notFound
+        ? "No superbill is available for this patient yet. A billable encounter is needed before a superbill can be generated."
+        : "Could not generate the superbill. " + err.message
+    );
+  }
+}
+
+function printSuperbill() {
+  document.body.classList.add("printing-superbill");
+  window.print();
+  // cleanup after the print dialog closes
+  setTimeout(() => document.body.classList.remove("printing-superbill"), 0);
+}
+
 /* ---------- init ---------- */
 function init() {
   $("#btn-sample").addEventListener("click", loadSamplePatient);
   $("#btn-sample-empty").addEventListener("click", loadSamplePatient);
+
+  // Notes
+  $("#btn-new-note").addEventListener("click", openEditor);
+  $("#btn-cancel-note").addEventListener("click", closeEditor);
+  $("#btn-save-note").addEventListener("click", saveNote);
+  $("#btn-regen-skeleton").addEventListener("click", fillSkeleton);
+  $("#btn-close-note").addEventListener("click", () => { $("#note-detail").hidden = true; });
+  // re-fill skeleton on type/setting change, but don't silently clobber edits
+  const maybeRefill = () => {
+    const current = $("#note-text").value || "";
+    // Unedited (still the last-generated skeleton) or empty → refill freely.
+    if (!current.trim() || current === lastSkeleton) {
+      fillSkeleton();
+      return;
+    }
+    if (confirm("Replace the current note text with a fresh skeleton for this type and setting? Your edits will be lost.")) {
+      fillSkeleton();
+    }
+  };
+  $("#note-type").addEventListener("change", maybeRefill);
+  $("#note-setting").addEventListener("change", maybeRefill);
+
+  // Superbill
+  $("#btn-superbill").addEventListener("click", generateSuperbill);
+  $("#btn-print-superbill").addEventListener("click", printSuperbill);
+  $("#btn-close-superbill").addEventListener("click", closeSuperbill);
+
   loadPatients();
 }
 

@@ -27,7 +27,7 @@ use axum::{
 use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
-use fhir::{capability_statement, is_supported, operation_outcome};
+use fhir::{capability_statement, is_supported, now_iso8601, operation_outcome};
 use store::{ChartStore, SqliteStore};
 
 type SharedStore = Arc<dyn ChartStore>;
@@ -159,6 +159,98 @@ fn references_patient(resource: &Value, id: &str) -> bool {
     matches("subject") || matches("patient")
 }
 
+/// GET /Patient/:id/$superbill — a coded-charge (superbill) export for one
+/// patient, as a FHIR instance operation. Reads the Patient and their active
+/// Conditions and returns a fixed-shape JSON document the frontend codes against:
+/// patient identity, today's date, the derived diagnosis list, and a placeholder
+/// E/M charge. Reading it touches PHI, so it records one `AuditEvent`.
+async fn superbill(
+    State(store): State<SharedStore>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let patient = match store.get("Patient", &id) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(operation_outcome(
+                    "error",
+                    "not-found",
+                    &format!("Patient/{id} not found"),
+                )),
+            )
+        }
+        Err(e) => return server_error(&e.to_string()),
+    };
+
+    // Diagnoses: the patient's Conditions, matched with the SAME helper the
+    // search handler uses (subject.reference OR patient.reference == Patient/id).
+    let conditions = match store.list("Condition") {
+        Ok(v) => v,
+        Err(e) => return server_error(&e.to_string()),
+    };
+    let diagnoses: Vec<Value> = conditions
+        .into_iter()
+        .filter(|c| references_patient(c, &id))
+        .map(|c| json!({ "text": c["code"]["text"] }))
+        .collect();
+
+    // Audit the PHI read before returning data, reusing the read helper. The
+    // `<id>/$superbill` entity distinguishes a superbill read from a plain read.
+    // Auditing failure is a 500, never a body returned unlogged (matches reads).
+    if let Err(e) = audit::record_audit_read(store.as_ref(), "Patient", &format!("{id}/$superbill"))
+    {
+        return server_error(&e.to_string());
+    }
+
+    let body = json!({
+        "patient": {
+            "id": id,
+            "name": patient_display_name(&patient),
+            // birthDate only when the Patient carries one.
+            "birthDate": patient["birthDate"],
+        },
+        "date": now_iso8601(),
+        "diagnoses": diagnoses,
+        // ponytail: fixed placeholder E/M. Real MDM/time-based leveling (picking
+        // 99212–99215 from the chart) is future work; for now one hard-coded code.
+        "charge": {
+            "cpt": "99214",
+            "description": "Office/outpatient visit, established patient, moderate MDM",
+        },
+        "note": "Diagnoses are derived from the chart's active problem list. \
+                 The E/M level is a placeholder pending MDM-based leveling.",
+    });
+
+    // Drop birthDate when the Patient had none, honoring the "if present" contract.
+    let mut body = body;
+    if body["patient"]["birthDate"].is_null() {
+        body["patient"]
+            .as_object_mut()
+            .expect("patient is an object")
+            .remove("birthDate");
+    }
+
+    (StatusCode::OK, Json(body))
+}
+
+/// A human display name from a FHIR Patient's `name[0]`: given tokens joined with
+/// the family name, falling back to `name[0].text`, then to an empty string.
+fn patient_display_name(patient: &Value) -> String {
+    let name = &patient["name"][0];
+    let mut parts: Vec<String> = name["given"]
+        .as_array()
+        .map(|g| g.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    if let Some(family) = name["family"].as_str() {
+        parts.push(family.to_string());
+    }
+    if !parts.is_empty() {
+        return parts.join(" ");
+    }
+    name["text"].as_str().unwrap_or("").to_string()
+}
+
 /// GET /metadata — the FHIR CapabilityStatement for this server.
 async fn metadata() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(capability_statement()))
@@ -234,6 +326,10 @@ fn server_error(detail: &str) -> (StatusCode, Json<Value>) {
 fn app(store: SharedStore) -> Router {
     Router::new()
         .route("/metadata", get(metadata))
+        // Instance operation: a 3-segment literal-tail route. It does NOT collide
+        // with the 2-segment `/:resource_type/:id` param route below; axum matches
+        // by segment count, so this wins for `/Patient/<id>/$superbill`.
+        .route("/Patient/:id/$superbill", get(superbill))
         .route(
             "/:resource_type",
             post(create_resource).get(search_resources),
@@ -580,6 +676,110 @@ mod tests {
                 resource["type"]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn superbill_lists_the_patients_active_diagnoses_and_name() {
+        let store = mem_store();
+
+        // A patient with a given+family name and a birthDate.
+        let (_, Json(patient)) = create_resource(
+            State(store.clone()),
+            Path("Patient".into()),
+            Json(json!({
+                "name": [{"given": ["Eleanor", "M"], "family": "Whitfield"}],
+                "birthDate": "1948-03-21",
+            })),
+        )
+        .await;
+        let id = patient["id"].as_str().unwrap().to_string();
+
+        // Two Conditions for this patient (one via subject, one via patient ref)...
+        store
+            .put(
+                "Condition",
+                "c1",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": {"reference": format!("Patient/{id}")},
+                    "code": {"text": "Essential hypertension"},
+                }),
+            )
+            .unwrap();
+        store
+            .put(
+                "Condition",
+                "c2",
+                &json!({
+                    "resourceType": "Condition",
+                    "patient": {"reference": format!("Patient/{id}")},
+                    "code": {"text": "Type 2 diabetes mellitus"},
+                }),
+            )
+            .unwrap();
+        // ...and one for someone else, which must NOT appear.
+        store
+            .put(
+                "Condition",
+                "c3",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": {"reference": "Patient/someone-else"},
+                    "code": {"text": "Asthma"},
+                }),
+            )
+            .unwrap();
+
+        let (code, Json(bill)) =
+            superbill(State(store.clone()), Path(id.clone())).await;
+        assert_eq!(code, StatusCode::OK);
+
+        assert_eq!(bill["patient"]["id"], id);
+        assert_eq!(bill["patient"]["name"], "Eleanor M Whitfield");
+        assert_eq!(bill["patient"]["birthDate"], "1948-03-21");
+        assert_eq!(bill["charge"]["cpt"], "99214");
+
+        let texts: Vec<&str> = bill["diagnoses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts.len(), 2, "exactly the patient's two Conditions");
+        assert!(texts.contains(&"Essential hypertension"));
+        assert!(texts.contains(&"Type 2 diabetes mellitus"));
+        assert!(!texts.contains(&"Asthma"), "another patient's Condition must be excluded");
+    }
+
+    #[tokio::test]
+    async fn superbill_for_missing_patient_is_404_operation_outcome() {
+        let store = mem_store();
+        let (code, Json(oo)) =
+            superbill(State(store), Path("ghost".into())).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert_eq!(oo["resourceType"], "OperationOutcome");
+    }
+
+    #[tokio::test]
+    async fn superbill_records_an_audit_event() {
+        let store = mem_store();
+        let (_, Json(patient)) = create_resource(
+            State(store.clone()),
+            Path("Patient".into()),
+            Json(json!({"name": [{"family": "Rao"}]})),
+        )
+        .await;
+        let id = patient["id"].as_str().unwrap().to_string();
+
+        let (code, _) = superbill(State(store.clone()), Path(id.clone())).await;
+        assert_eq!(code, StatusCode::OK);
+
+        // One read AuditEvent whose entity marks it as the superbill read.
+        let reference = format!("Patient/{id}/$superbill");
+        let found = find_by(&store, "AuditEvent", |e| {
+            e["action"] == json!("R") && e["entity"][0]["what"]["reference"] == json!(reference)
+        });
+        assert!(found, "expected an AuditEvent (action R) for {reference}");
     }
 
     /// Audit/provenance records each get a fresh uuid, so they're found by

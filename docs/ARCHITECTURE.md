@@ -25,6 +25,18 @@ The API grew a search interaction and started serving a UI:
 
 Still not built: promoted columns/indexes, the Postgres backend, auth, real signing, and everything under *AI, done responsibly*.
 
+## Milestone 3 (done)
+
+The first *view* on the FHIR data that isn't generic CRUD — the coded-charge / superbill export promised under *What we are deliberately NOT building early*:
+
+- **Superbill operation:** `GET /Patient/:id/$superbill` returns a fixed-shape JSON document the frontend codes against — `patient` (id, a human display name derived from `name[0]`, and `birthDate` when present), today's `date`, a `diagnoses` list, a placeholder `charge`, and an explanatory `note`. A missing patient is a `404` `OperationOutcome`, same builder/shape as the read path.
+- **Diagnoses are a view, not new data:** they're the patient's Conditions, filtered with the *same* `subject.reference`-OR-`patient.reference` match the search handler uses (one shared `references_patient` helper, not a second copy). No Condition is stored or mutated; the superbill is read-only.
+- **PHI read is audited:** the operation records exactly one append-only `AuditEvent` through the existing `record_audit_read` helper, with a `Patient/<id>/$superbill` entity so a superbill read is distinguishable from a plain read. Auditing failure is a `500`, never a body returned unlogged — mirroring the read/search paths.
+- **The charge is an honest placeholder:** a hard-coded `99214` (established-patient, moderate MDM), flagged in-code as a `ponytail:` shortcut. Real MDM/time-based E/M leveling is deliberately *not* implemented — no leveling algorithm was invented.
+- **Notes are already covered by existing CRUD:** a clinical note is a `DocumentReference`, created/read/searched through the Milestone 1–2 API with no new endpoint. The note-authoring engine (ambient scribe, drafting UI) is the frontend's job on top of that existing API, not backend work in this milestone.
+
+Still not built: promoted columns/indexes, the Postgres backend, auth, real signing, MDM-based E/M leveling, and everything under *AI, done responsibly*.
+
 ## The one idea
 
 **The data model is FHIR. Everything else is a view on it.**

@@ -307,3 +307,252 @@ body {
   .cards { grid-template-columns: 1fr; }
   .main { padding: 20px; }
 }
+
+/* ---------- Chart header actions ---------- */
+.chart-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.chart-actions { flex-shrink: 0; }
+
+/* small button variant */
+.btn-sm { padding: 6px 12px; font-size: 13px; }
+
+/* ---------- Notes card ---------- */
+.card-wide { margin-top: 18px; }
+.card-head-actions { display: flex; align-items: center; gap: 10px; }
+
+.note-item { cursor: pointer; }
+.note-item:hover { background: var(--surface-2); }
+
+/* editor */
+.note-editor {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.note-editor-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.field select {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 8px 10px;
+  min-width: 180px;
+  cursor: pointer;
+}
+.field select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+.note-text {
+  width: 100%;
+  min-height: 320px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 12px 14px;
+  resize: vertical;
+  tab-size: 4;
+}
+.note-text:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+.note-editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.note-editor-buttons { display: flex; gap: 8px; }
+.note-save-msg { font-size: 13px; color: var(--text-soft); }
+
+/* detail */
+.note-detail {
+  border-top: 1px solid var(--border);
+  padding: 16px 18px;
+  background: var(--surface-2);
+}
+.note-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.note-detail-title { font-size: 15px; font-weight: 700; }
+.note-detail-meta { font-size: 12.5px; color: var(--text-faint); margin-top: 2px; }
+.note-detail-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  tab-size: 4;
+}
+
+/* ---------- Superbill ---------- */
+.superbill {
+  margin-top: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.superbill-chrome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.superbill-chrome h2 { margin: 0; font-size: 14px; font-weight: 700; }
+.superbill-chrome-actions { display: flex; gap: 8px; }
+
+.superbill-sheet { padding: 28px 32px; }
+.superbill-loading, .superbill-error {
+  font-size: 14px;
+  color: var(--text-soft);
+  padding: 8px 0;
+}
+.superbill-error { color: var(--warn); }
+
+.sb-head {
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 14px;
+  margin-bottom: 18px;
+}
+.sb-brand {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--accent-ink);
+  letter-spacing: -0.01em;
+}
+.sb-doc-title { font-size: 13px; color: var(--text-soft); margin-top: 2px; }
+
+.sb-idrow {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px 28px;
+  margin-bottom: 22px;
+}
+.sb-field { display: flex; flex-direction: column; gap: 2px; }
+.sb-field-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.sb-field-val { font-size: 14.5px; font-weight: 500; }
+
+.sb-section { margin-bottom: 20px; }
+.sb-section-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  color: var(--accent-ink);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 10px;
+}
+.sb-dx-list { list-style: none; margin: 0; padding: 0; }
+.sb-dx-list li {
+  padding: 6px 0;
+  font-size: 14px;
+  border-bottom: 1px solid var(--surface-2);
+}
+.sb-dx-list li:last-child { border-bottom: none; }
+.sb-dx-empty { color: var(--text-faint); font-style: italic; }
+
+.sb-charge {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.sb-cpt { display: flex; flex-direction: column; gap: 2px; }
+.sb-cpt-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.sb-cpt-code {
+  font-size: 18px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--accent-ink);
+}
+.sb-charge-desc { font-size: 14px; color: var(--text); }
+
+.sb-note-body {
+  font-size: 13.5px;
+  color: var(--text-soft);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+/* ---------- Print: isolate the superbill ---------- */
+@media print {
+  body.printing-superbill { background: #fff; display: block; min-height: auto; }
+  /* hide everything, then reveal only the superbill sheet */
+  body.printing-superbill .topbar,
+  body.printing-superbill .sidebar,
+  body.printing-superbill #banner,
+  body.printing-superbill .chart-header,
+  body.printing-superbill .cards,
+  body.printing-superbill #card-notes,
+  body.printing-superbill .superbill-chrome {
+    display: none !important;
+  }
+  body.printing-superbill .layout,
+  body.printing-superbill .main,
+  body.printing-superbill .chart {
+    display: block;
+    overflow: visible;
+    height: auto;
+    max-width: none;
+    padding: 0;
+    margin: 0;
+  }
+  body.printing-superbill .superbill {
+    border: none;
+    box-shadow: none;
+    margin: 0;
+  }
+  body.printing-superbill .superbill-sheet { padding: 0; }
+  body.printing-superbill .superbill[hidden] { display: none !important; }
+}
