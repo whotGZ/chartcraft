@@ -152,14 +152,17 @@ impl ChartStore for SqliteStore {
     }
 
     fn get(&self, resource_type: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        use rusqlite::OptionalExtension;
         let conn = self.conn.lock().unwrap();
+        // `.optional()?` maps "no such row" to None but PROPAGATES a real DB fault
+        // as Err — a database error must never read back as "patient not found".
         let payload: Option<String> = conn
             .query_row(
                 "SELECT payload FROM resources WHERE resource_type = ?1 AND id = ?2",
                 rusqlite::params![resource_type, id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         match payload {
             Some(s) => Ok(Some(
                 serde_json::from_str(&s).map_err(|e| StoreError::Db(e.to_string()))?,

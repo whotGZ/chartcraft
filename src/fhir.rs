@@ -13,6 +13,9 @@ pub const SUPPORTED_TYPES: &[&str] = &[
     "AllergyIntolerance",
     "Observation",
     "DocumentReference",
+    "Encounter",
+    "ServiceRequest",
+    "DiagnosticReport",
 ];
 
 pub fn is_supported(resource_type: &str) -> bool {

@@ -60,6 +60,28 @@ pub fn record_audit_search(
     Ok(())
 }
 
+/// Append an `AuditEvent` recording a write (create/update) of a clinical
+/// resource. `action` is the FHIR AuditEvent code: `"C"` (create) or `"U"`
+/// (update). Mirrors `record_audit_read` — a write is a PHI touch too, so it
+/// must be audited, not just attributed via Provenance.
+pub fn record_audit_write(
+    store: &dyn ChartStore,
+    resource_type: &str,
+    id: &str,
+    action: &str,
+) -> Result<(), StoreError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let event = json!({
+        "resourceType": "AuditEvent",
+        "id": event_id,
+        "action": action,
+        "recorded": now_iso8601(),
+        "entity": [{"what": {"reference": format!("{resource_type}/{id}")}}],
+    });
+    store.put("AuditEvent", &event_id, &event)?;
+    Ok(())
+}
+
 /// Append an `AuditEvent` recording a successful read of a clinical resource.
 pub fn record_audit_read(
     store: &dyn ChartStore,

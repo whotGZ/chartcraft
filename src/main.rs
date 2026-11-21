@@ -41,6 +41,9 @@ async fn create_resource(
     if let Some(bad) = reject_type(&resource_type, &body) {
         return bad;
     }
+    if let Some(bad) = reject_non_object(&body) {
+        return bad;
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     body["resourceType"] = json!(resource_type);
@@ -56,6 +59,9 @@ async fn update_resource(
     Json(mut body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     if let Some(bad) = reject_type(&resource_type, &body) {
+        return bad;
+    }
+    if let Some(bad) = reject_non_object(&body) {
         return bad;
     }
 
@@ -143,9 +149,12 @@ async fn search_resources(
 /// (percent-literal) id; ids are server-assigned uuids, so no decoding is needed.
 fn patient_param(query: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
-        pair.strip_prefix("patient=")
-            .filter(|v| !v.is_empty())
-            .map(|v| v.to_string())
+        // A present-but-empty `patient=` must NOT be dropped: a `Some("")` flows
+        // through to `references_patient`, which builds target "Patient/" and
+        // matches nothing — so an empty filter returns an empty searchset, not
+        // every patient's resources. Dropping it here would re-open that
+        // cross-patient PHI overexposure. Only a wholly absent param → None.
+        pair.strip_prefix("patient=").map(|v| v.to_string())
     })
 }
 
@@ -298,6 +307,13 @@ fn write(
     if let Err(e) = audit::record_provenance(store.as_ref(), resource_type, id) {
         return server_error(&e.to_string());
     }
+    // A write is a PHI touch, so it must be audited too (Provenance attributes,
+    // AuditEvent logs the access). "C" on a create (version 1), "U" on update.
+    // As with reads, a failure to audit must not return a body unlogged — 500.
+    let action = if version == 1 { "C" } else { "U" };
+    if let Err(e) = audit::record_audit_write(store.as_ref(), resource_type, id, action) {
+        return server_error(&e.to_string());
+    }
     // FHIR: 201 when this write created the resource, 200 when it updated one.
     let code = if version == 1 {
         StatusCode::CREATED
@@ -328,6 +344,23 @@ fn reject_type(resource_type: &str, body: &Value) -> Option<(StatusCode, Json<Va
         }
     }
     None
+}
+
+/// 400 if the parsed body isn't a JSON object. A non-object (array/string/number)
+/// would panic on `body["resourceType"] = ...` (serde_json `IndexMut` only works
+/// on objects), so reject it before any such mutation. `None` to proceed.
+fn reject_non_object(body: &Value) -> Option<(StatusCode, Json<Value>)> {
+    if body.is_object() {
+        return None;
+    }
+    Some((
+        StatusCode::BAD_REQUEST,
+        Json(operation_outcome(
+            "error",
+            "invalid",
+            "request body must be a FHIR resource (JSON object)",
+        )),
+    ))
 }
 
 fn unsupported(resource_type: &str) -> (StatusCode, Json<Value>) {
@@ -534,6 +567,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_records_a_c_audit_event_and_update_records_a_u() {
+        let store = mem_store();
+
+        // A create (first write of this id) must log a "C" AuditEvent.
+        let (code, Json(patient)) = create_resource(
+            State(store.clone()),
+            Path("Patient".into()),
+            Json(json!({"name": [{"family": "Audit"}]})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        let id = patient["id"].as_str().unwrap().to_string();
+        let reference = format!("Patient/{id}");
+
+        let created = find_by(&store, "AuditEvent", |e| {
+            e["action"] == json!("C") && e["entity"][0]["what"]["reference"] == json!(reference)
+        });
+        assert!(created, "a create must record a 'C' AuditEvent for {reference}");
+
+        // A PUT at that same id updates it (version 2) → must log a "U" AuditEvent.
+        let (code, _) = update_resource(
+            State(store.clone()),
+            Path(("Patient".into(), id.clone())),
+            Json(json!({"name": [{"family": "Audited"}]})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        let updated = find_by(&store, "AuditEvent", |e| {
+            e["action"] == json!("U") && e["entity"][0]["what"]["reference"] == json!(reference)
+        });
+        assert!(updated, "a PUT-update must record a 'U' AuditEvent for {reference}");
+    }
+
+    #[tokio::test]
+    async fn non_object_body_is_400_not_a_panic() {
+        let store = mem_store();
+        // A JSON array as the body would panic on `body["resourceType"] = ...`;
+        // it must be rejected as 400 instead.
+        let (code, Json(oo)) = create_resource(
+            State(store),
+            Path("Patient".into()),
+            Json(json!([1, 2, 3])),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(oo["resourceType"], "OperationOutcome");
+    }
+
+    #[tokio::test]
+    async fn empty_patient_param_returns_an_empty_bundle() {
+        let store = mem_store();
+        // Store a Condition that WOULD be returned by a bare type search.
+        store
+            .put(
+                "Condition",
+                "c1",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": {"reference": "Patient/alice"},
+                    "code": {"text": "Hypertension"},
+                }),
+            )
+            .unwrap();
+
+        // `?patient=` present but empty must match NOTHING, not everything.
+        let (code, Json(bundle)) = search_resources(
+            State(store.clone()),
+            Path("Condition".into()),
+            RawQuery(Some("patient=".into())),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(bundle["type"], "searchset");
+        assert_eq!(bundle["total"], 0, "empty patient filter must return nothing");
+        assert!(bundle["entry"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn encounter_is_an_accepted_type() {
+        let store = mem_store();
+        // MF-11: the architecture doc advertises Encounter; POST must be accepted.
+        let (code, Json(enc)) = create_resource(
+            State(store),
+            Path("Encounter".into()),
+            Json(json!({"status": "finished"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(enc["resourceType"], "Encounter");
+    }
+
+    #[tokio::test]
     async fn get_type_returns_a_searchset_bundle() {
         let store = mem_store();
         for family in ["Sharma", "Rao", "Komi"] {
@@ -686,6 +812,10 @@ mod tests {
             .collect();
         assert!(types.contains(&"Patient"));
         assert!(types.contains(&"DocumentReference"));
+        // MF-11: the newly-supported types must also be advertised.
+        assert!(types.contains(&"Encounter"));
+        assert!(types.contains(&"ServiceRequest"));
+        assert!(types.contains(&"DiagnosticReport"));
 
         // M2: every resource must advertise the search-type interaction.
         for resource in cap["rest"][0]["resource"].as_array().unwrap() {

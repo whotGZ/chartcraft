@@ -8,12 +8,12 @@ This is a clinician's starting map, not legal advice. Correct it, deepen it, PR 
 
 A physician in a direct-pay / cash practice can keep their medical records in software they chose, including software they wrote. There is no federal law requiring an EMR to be *certified* for a clinician to document care in it. What governs Tier 1 is:
 
-- **HIPAA Security & Privacy Rules**, if you transmit claims electronically or otherwise become a covered entity. Technical safeguards: access control, audit controls, integrity, authentication, and encryption of PHI in transit and at rest. This is real from line one, and ChartCraft is built toward it (auth, append-only audit, encryption).
+- **HIPAA Security & Privacy Rules**, if you transmit claims electronically or otherwise become a covered entity. Technical safeguards: access control, audit controls, integrity, authentication, and encryption of PHI in transit and at rest. ChartCraft is built *toward* these — a `Provenance`/`AuditEvent` spine exists today, but authentication, encryption at rest, and tamper-evident (hash-chained) audit are the M4 milestone and are **not yet implemented**. Until they are, this is not a HIPAA-ready system.
 - **State medical-record law**: retention periods, amendment rights, consent, data residency. Varies by state.
 
-So Tier 1 is reachable. The wedge that follows from this: **the author can be ChartCraft's own first production user**, signing real charts in his own practice. That dogfooding is the one asset no engineering team can buy, and it is what makes this project credible rather than theoretical.
+So Tier 1 is *reachable* — it is the goal, not the current state. The wedge that follows: once the Tier-1 safeguards are built (M4), **the author can be ChartCraft's own first production user**, signing real charts in his own practice. That dogfooding is the one asset no engineering team can buy, and it is what makes this project credible rather than theoretical. Until M4 lands, ChartCraft runs on synthetic or de-identified data only.
 
-Tier 1 raises the bar on us: if we claim real-chart use, HIPAA rigor has to be real from the first commit, not deferred.
+Tier 1 raises the bar on us: real-chart use demands real HIPAA rigor, so real-chart use *waits* for that rigor (M4) rather than preceding it. We would rather be late to the first real patient than lie about being ready for one.
 
 ## Tier 2 — ONC certification, for CMS programs and the wider ecosystem
 
