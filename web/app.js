@@ -363,6 +363,13 @@ function showEmptyState() {
 }
 
 async function selectPatient(id) {
+  // Guard unsaved note text BEFORE mutating any state, so a cancel leaves the
+  // current patient (and the list highlight) exactly as they were.
+  if (noteIsDirty() &&
+      !confirm("You have an unsaved note. Switch patients and discard it?")) {
+    return;
+  }
+
   selectedId = id;
   // reflect selection in list
   document.querySelectorAll(".patient-item").forEach((li) => {
@@ -453,6 +460,11 @@ function openNote(doc) {
 function resetNotePanels() {
   const ed = $("#note-editor");
   if (ed) ed.hidden = true;
+  // Clear the editor text so patient A's note never lingers in the hidden DOM
+  // while patient B is shown (and so noteIsDirty() reads clean after a switch).
+  const txt = $("#note-text");
+  if (txt) txt.value = "";
+  lastSkeleton = "";
   const det = $("#note-detail");
   if (det) det.hidden = true;
   const msg = $("#note-save-msg");
@@ -461,6 +473,16 @@ function resetNotePanels() {
 
 /* ---------- notes: editor ---------- */
 let lastSkeleton = "";
+
+/* True when the editor is open and holds text the user would lose on a refill
+   or a patient switch: visible, non-empty, and no longer the generated skeleton. */
+function noteIsDirty() {
+  const ed = $("#note-editor");
+  if (!ed || ed.hidden) return false;
+  const current = $("#note-text").value || "";
+  return !!current.trim() && current !== lastSkeleton;
+}
+
 function fillSkeleton() {
   const type = $("#note-type").value;
   const setting = $("#note-setting").value;
@@ -468,9 +490,27 @@ function fillSkeleton() {
   $("#note-text").value = lastSkeleton;
 }
 
+/* Clinics don't admit/discharge, so "Discharge summary" is incoherent for an
+   outpatient clinic. Disable that option for the clinic setting (keep all three
+   for ICU and SNF); if it was the active choice, fall back to "Progress note". */
+function gateNoteTypes() {
+  const setting = $("#note-setting").value;
+  const typeSel = $("#note-type");
+  const dischargeOpt = Array.from(typeSel.options)
+    .find((o) => o.value === "Discharge summary");
+  if (!dischargeOpt) return;
+  const clinic = setting === "Outpatient clinic";
+  dischargeOpt.disabled = clinic;
+  dischargeOpt.hidden = clinic;
+  if (clinic && typeSel.value === "Discharge summary") {
+    typeSel.value = "Progress note";
+  }
+}
+
 function openEditor() {
   $("#note-detail").hidden = true;
   $("#note-save-msg").textContent = "";
+  gateNoteTypes();
   fillSkeleton();
   const ed = $("#note-editor");
   ed.hidden = false;
@@ -485,6 +525,9 @@ function closeEditor() {
 
 async function saveNote() {
   if (!selectedId) return;
+  // Pin the patient this save belongs to. `selectedId` can change mid-await if
+  // the user switches charts; everything below must use `pid`, not the global.
+  const pid = selectedId;
   const type = $("#note-type").value;
   const setting = $("#note-setting").value;
   const text = $("#note-text").value || "";
@@ -497,7 +540,7 @@ async function saveNote() {
     resourceType: "DocumentReference",
     status: "current",
     type: { text: type },
-    subject: { reference: "Patient/" + selectedId },
+    subject: { reference: "Patient/" + pid },
     date: new Date().toISOString(),
     author: [{ display: SIGNING_CLINICIAN }],
     content: [{ attachment: { contentType: "text/plain", data: encodeNote(text) } }],
@@ -506,9 +549,13 @@ async function saveNote() {
 
   try {
     const saved = await apiPost("DocumentReference", body);
+    // The user may have switched patients during the POST — don't render this
+    // note under whoever is on screen now.
+    if (selectedId !== pid) return;
     closeEditor();
     // refresh the notes list, then show the just-saved note
-    const docB = await apiGet("/DocumentReference?patient=" + encodeURIComponent(selectedId)).catch(() => null);
+    const docB = await apiGet("/DocumentReference?patient=" + encodeURIComponent(pid)).catch(() => null);
+    if (selectedId !== pid) return;
     renderNotes(entries(docB));
     openNote(saved && saved.resourceType ? saved : body);
   } catch (err) {
@@ -650,7 +697,7 @@ function renderSuperbill(data) {
   idRow.appendChild(mkField("Patient", name));
   idRow.appendChild(mkField("Date of birth", dob || "—"));
   idRow.appendChild(mkField("Patient ID", pt.id || "—"));
-  idRow.appendChild(mkField("Date of service", fmtDate(data?.date) || data?.date || "—"));
+  idRow.appendChild(mkField("Generated", fmtDate(data?.date) || data?.date || "—"));
   sheet.appendChild(idRow);
 
   // Diagnoses
@@ -671,6 +718,11 @@ function renderSuperbill(data) {
   // Charge
   const chSection = el("div", "sb-section");
   chSection.appendChild(el("div", "sb-section-title", "Charge"));
+  // Honesty banner: this is a placeholder E/M code, never a real billable charge.
+  // Border + bold text (not a background fill) so it survives print color-stripping.
+  chSection.appendChild(
+    el("div", "sb-charge-badge", "SAMPLE CHARGE — NOT FOR CLAIM SUBMISSION")
+  );
   const charge = data?.charge || {};
   const chargeRow = el("div", "sb-charge");
   const cpt = el("div", "sb-cpt");
@@ -708,7 +760,7 @@ async function generateSuperbill() {
     const notFound = /→\s*404/.test(err.message);
     renderSuperbillError(
       notFound
-        ? "No superbill is available for this patient yet. A billable encounter is needed before a superbill can be generated."
+        ? "This patient could not be found; the chart may have been removed. Reload the patient list and try again."
         : "Could not generate the superbill. " + err.message
     );
   }
@@ -734,9 +786,8 @@ function init() {
   $("#btn-close-note").addEventListener("click", () => { $("#note-detail").hidden = true; });
   // re-fill skeleton on type/setting change, but don't silently clobber edits
   const maybeRefill = () => {
-    const current = $("#note-text").value || "";
     // Unedited (still the last-generated skeleton) or empty → refill freely.
-    if (!current.trim() || current === lastSkeleton) {
+    if (!noteIsDirty()) {
       fillSkeleton();
       return;
     }
@@ -745,7 +796,13 @@ function init() {
     }
   };
   $("#note-type").addEventListener("change", maybeRefill);
-  $("#note-setting").addEventListener("change", maybeRefill);
+  // Gate the type options for the new setting BEFORE refilling, so a forced
+  // fallback (e.g. Discharge → Progress on switching to clinic) regenerates the
+  // correct skeleton.
+  $("#note-setting").addEventListener("change", () => {
+    gateNoteTypes();
+    maybeRefill();
+  });
 
   // Superbill
   $("#btn-superbill").addEventListener("click", generateSuperbill);

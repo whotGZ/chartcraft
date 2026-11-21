@@ -1,4 +1,4 @@
-//! ChartCraft — Milestone 2.
+//! ChartCraft — Milestone 3.
 //!
 //! A FHIR-native EMR core: generic CRUD plus type-level search over any supported
 //! US Core resource type, persisted through a `ChartStore` (SQLite for the real
@@ -159,6 +159,27 @@ fn references_patient(resource: &Value, id: &str) -> bool {
     matches("subject") || matches("patient")
 }
 
+/// True if a Condition belongs on a billable "active problem list": clinically
+/// active AND not an erroneous record.
+///
+/// `clinicalStatus` is `mustSupport` (not required) in US Core, so a Condition may
+/// legitimately carry none — we treat an ABSENT status as billable rather than
+/// silently dropping real problems. When present, only active-family codes
+/// (`active`/`recurrence`/`relapse`) count; `resolved`/`inactive`/`remission` do not.
+/// Separately, a `verificationStatus` of `entered-in-error`/`refuted` marks the
+/// record itself as bogus, so it's excluded regardless of clinical status.
+fn is_billable_condition(c: &Value) -> bool {
+    let clinical_ok = match c["clinicalStatus"]["coding"][0]["code"].as_str() {
+        None => true, // absent status: mustSupport, not required — keep it
+        Some(code) => matches!(code, "active" | "recurrence" | "relapse"),
+    };
+    let verification_ok = !matches!(
+        c["verificationStatus"]["coding"][0]["code"].as_str(),
+        Some("entered-in-error") | Some("refuted")
+    );
+    clinical_ok && verification_ok
+}
+
 /// GET /Patient/:id/$superbill — a coded-charge (superbill) export for one
 /// patient, as a FHIR instance operation. Reads the Patient and their active
 /// Conditions and returns a fixed-shape JSON document the frontend codes against:
@@ -191,7 +212,7 @@ async fn superbill(
     };
     let diagnoses: Vec<Value> = conditions
         .into_iter()
-        .filter(|c| references_patient(c, &id))
+        .filter(|c| references_patient(c, &id) && is_billable_condition(c))
         .map(|c| json!({ "text": c["code"]["text"] }))
         .collect();
 
@@ -234,10 +255,17 @@ async fn superbill(
     (StatusCode::OK, Json(body))
 }
 
-/// A human display name from a FHIR Patient's `name[0]`: given tokens joined with
-/// the family name, falling back to `name[0].text`, then to an empty string.
+/// A human display name from a FHIR Patient's `name[0]`, using the same
+/// FHIR-conventional precedence as the frontend so the chart header and the
+/// superbill never disagree: prefer `name[0].text`, else given tokens joined with
+/// the family name, else an empty string.
 fn patient_display_name(patient: &Value) -> String {
     let name = &patient["name"][0];
+    if let Some(text) = name["text"].as_str() {
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
     let mut parts: Vec<String> = name["given"]
         .as_array()
         .map(|g| g.iter().filter_map(|v| v.as_str()).map(str::to_string).collect())
@@ -245,10 +273,7 @@ fn patient_display_name(patient: &Value) -> String {
     if let Some(family) = name["family"].as_str() {
         parts.push(family.to_string());
     }
-    if !parts.is_empty() {
-        return parts.join(" ");
-    }
-    name["text"].as_str().unwrap_or("").to_string()
+    parts.join(" ")
 }
 
 /// GET /metadata — the FHIR CapabilityStatement for this server.
@@ -357,9 +382,9 @@ async fn main() {
         .await
         .expect("bind 127.0.0.1:8080");
     println!(
-        "ChartCraft M2 on http://127.0.0.1:8080 \
+        "ChartCraft M3 on http://127.0.0.1:8080 \
          (POST/GET /:resource_type, GET/PUT /:resource_type/:id, \
-         GET /metadata, static web/ at /)"
+         GET /Patient/:id/$superbill, GET /metadata, static web/ at /)"
     );
     axum::serve(listener, app(store)).await.unwrap();
 }
@@ -749,6 +774,72 @@ mod tests {
         assert!(texts.contains(&"Essential hypertension"));
         assert!(texts.contains(&"Type 2 diabetes mellitus"));
         assert!(!texts.contains(&"Asthma"), "another patient's Condition must be excluded");
+    }
+
+    #[tokio::test]
+    async fn superbill_excludes_resolved_and_entered_in_error_conditions() {
+        let store = mem_store();
+
+        let (_, Json(patient)) = create_resource(
+            State(store.clone()),
+            Path("Patient".into()),
+            Json(json!({"name": [{"family": "Okafor"}]})),
+        )
+        .await;
+        let id = patient["id"].as_str().unwrap().to_string();
+        let subject = json!({"reference": format!("Patient/{id}")});
+
+        // Active (no clinicalStatus at all) — US Core mustSupport, so this MUST bill.
+        store
+            .put(
+                "Condition",
+                "c-active",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": subject,
+                    "code": {"text": "Essential hypertension"},
+                }),
+            )
+            .unwrap();
+        // Resolved — clinically inactive, MUST be excluded.
+        store
+            .put(
+                "Condition",
+                "c-resolved",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": subject,
+                    "clinicalStatus": {"coding": [{"code": "resolved"}]},
+                    "code": {"text": "Acute bronchitis"},
+                }),
+            )
+            .unwrap();
+        // Entered-in-error — bogus record, MUST be excluded regardless of status.
+        store
+            .put(
+                "Condition",
+                "c-error",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": subject,
+                    "verificationStatus": {"coding": [{"code": "entered-in-error"}]},
+                    "code": {"text": "Keyed in error"},
+                }),
+            )
+            .unwrap();
+
+        let (code, Json(bill)) = superbill(State(store.clone()), Path(id)).await;
+        assert_eq!(code, StatusCode::OK);
+
+        let texts: Vec<&str> = bill["diagnoses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["Essential hypertension"], "only the active Condition bills");
+        assert!(!texts.contains(&"Acute bronchitis"), "resolved Condition must be excluded");
+        assert!(!texts.contains(&"Keyed in error"), "entered-in-error Condition must be excluded");
     }
 
     #[tokio::test]
