@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ChartCraft</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 3h6a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v0a2 2 0 0 1 2-2z" />
+          <path d="M7 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" />
+          <path d="M12 11v6M9 14h6" />
+        </svg>
+      </span>
+      <div class="brand-text">
+        <span class="brand-name">ChartCraft</span>
+        <span class="brand-tag">An open-source FHIR chart</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <span id="conn-status" class="conn" title="API connection"></span>
+      <button id="btn-sample" class="btn btn-primary" type="button">Load sample patient</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" hidden></div>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <h2>Patients</h2>
+        <span id="patient-count" class="count"></span>
+      </div>
+      <ul id="patient-list" class="patient-list" aria-label="Patient list"></ul>
+      <div id="patient-list-empty" class="sidebar-empty" hidden>No patients yet.</div>
+    </aside>
+
+    <section class="main" id="main">
+      <!-- Empty / onboarding state -->
+      <div id="empty-state" class="empty-state">
+        <div class="empty-illus" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="40" height="40" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="3" width="16" height="18" rx="2" />
+            <path d="M8 8h8M8 12h8M8 16h5" />
+          </svg>
+        </div>
+        <h3>No chart loaded</h3>
+        <p>Select a patient from the list, or load a demo chart to see ChartCraft in action.</p>
+        <button id="btn-sample-empty" class="btn btn-primary" type="button">Load sample patient</button>
+      </div>
+
+      <!-- Chart view -->
+      <article id="chart" class="chart" hidden>
+        <header class="chart-header">
+          <div class="chart-id">
+            <h1 id="pt-name">—</h1>
+            <div id="pt-meta" class="chart-demographics"></div>
+          </div>
+        </header>
+
+        <div class="cards">
+          <section class="card" id="card-problems">
+            <div class="card-head">
+              <h2>Problem List</h2>
+              <span class="pill" id="count-problems">0</span>
+            </div>
+            <ul class="data-list" id="list-problems"></ul>
+          </section>
+
+          <section class="card" id="card-meds">
+            <div class="card-head">
+              <h2>Medications</h2>
+              <span class="pill" id="count-meds">0</span>
+            </div>
+            <ul class="data-list" id="list-meds"></ul>
+          </section>
+
+          <section class="card" id="card-allergies">
+            <div class="card-head">
+              <h2>Allergies</h2>
+              <span class="pill pill-warn" id="count-allergies">0</span>
+            </div>
+            <ul class="data-list" id="list-allergies"></ul>
+          </section>
+
+          <section class="card" id="card-vitals">
+            <div class="card-head">
+              <h2>Vitals &amp; Observations</h2>
+              <span class="pill" id="count-vitals">0</span>
+            </div>
+            <ul class="data-list" id="list-vitals"></ul>
+          </section>
+        </div>
+      </article>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

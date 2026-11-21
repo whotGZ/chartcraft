@@ -31,6 +31,35 @@ pub fn record_provenance(
     Ok(())
 }
 
+/// Append an `AuditEvent` recording a search over a clinical resource type.
+///
+/// ponytail: ONE AuditEvent per search, not one per matched resource — the
+/// audited event is "a query ran", and its scope is the type (+ optional patient
+/// filter), not each row returned. We also don't guard against auditing searches
+/// of AuditEvent/Provenance here: those types aren't in SUPPORTED_TYPES, so the
+/// handler 400s before ever reaching this function, making the guard moot.
+pub fn record_audit_search(
+    store: &dyn ChartStore,
+    resource_type: &str,
+    patient: Option<&str>,
+) -> Result<(), StoreError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let query = match patient {
+        Some(p) => format!("{resource_type}?patient={p}"),
+        None => resource_type.to_string(),
+    };
+    let event = json!({
+        "resourceType": "AuditEvent",
+        "id": event_id,
+        // "E" = execute, the FHIR AuditEvent action for a search/query.
+        "action": "E",
+        "recorded": now_iso8601(),
+        "entity": [{"what": {"reference": query}}],
+    });
+    store.put("AuditEvent", &event_id, &event)?;
+    Ok(())
+}
+
 /// Append an `AuditEvent` recording a successful read of a clinical resource.
 pub fn record_audit_read(
     store: &dyn ChartStore,

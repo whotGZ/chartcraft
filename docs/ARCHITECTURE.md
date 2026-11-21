@@ -13,6 +13,18 @@ The storage seam and governance spine from this document now exist in code:
 
 Not yet built: promoted columns/indexes, the Postgres backend, auth, real signing, and everything under *AI, done responsibly*.
 
+## Milestone 2 (done)
+
+The API grew a search interaction and started serving a UI:
+
+- **Type-level FHIR search:** `GET /:type` returns a FHIR `Bundle` of `type` `searchset` (`total` + an `entry` array wrapping each resource). An optional `?patient=<id>` filters to resources that reference that patient via **either** `subject.reference` **or** `patient.reference` — different US Core types promote different fields, so both are matched. Without the param it returns every resource of the type (e.g. `GET /Patient` for the patient picker). Unknown types are rejected `400` with an `OperationOutcome`, same as the CRUD path. The filter runs in the handler over the store's `list(type)` — the seam `list` was always meant to become — so no new store method was added.
+- **Search audit:** each search records exactly **one** append-only `AuditEvent` (`action: "E"`, the FHIR execute/query action), scoped to the type and optional patient filter — not one event per matched row. Auditing failure is a `500`, never a Bundle returned unlogged, mirroring the read path.
+- **Static web serving:** the `web/` directory is served two ways via `tower-http`'s `ServeDir` — `GET /` falls back to `web/index.html`, and assets live under a reserved literal prefix `GET /static/*` (e.g. `/static/app.js`, `/static/style.css`). A literal segment wins over the `/:resource_type` param route in axum's router, so assets are served rather than shadowed by search.
+- **A clinician web screen** (`web/`, vanilla HTML/CSS/JS, no framework/build/CDN): patient picker, demographics header, and Problem List / Medications / Allergies / Vitals cards read live from the FHIR search API, plus a "Load sample patient" button that POSTs a populated demo chart.
+- **`GET /metadata`** now advertises the `search-type` interaction on every resource type alongside `read`/`create`/`update`.
+
+Still not built: promoted columns/indexes, the Postgres backend, auth, real signing, and everything under *AI, done responsibly*.
+
 ## The one idea
 
 **The data model is FHIR. Everything else is a view on it.**

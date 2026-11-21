@@ -32,7 +32,7 @@ pub fn operation_outcome(severity: &str, code: &str, diagnostics: &str) -> Value
 }
 
 /// Minimal FHIR R4 `CapabilityStatement` describing what this server does:
-/// read / create / update on each supported resource type.
+/// read / search-type / create / update on each supported resource type.
 pub fn capability_statement() -> Value {
     let resources: Vec<Value> = SUPPORTED_TYPES
         .iter()
@@ -41,6 +41,7 @@ pub fn capability_statement() -> Value {
                 "type": t,
                 "interaction": [
                     {"code": "read"},
+                    {"code": "search-type"},
                     {"code": "create"},
                     {"code": "update"},
                 ]

@@ -1,10 +1,11 @@
-//! ChartCraft — Milestone 1.
+//! ChartCraft — Milestone 2.
 //!
-//! A FHIR-native EMR core: generic CRUD over any supported US Core resource
-//! type, persisted through a `ChartStore` (SQLite for the real binary,
-//! in-memory for tests), with a governance spine — a `Provenance` written on
-//! every create/update and an append-only `AuditEvent` on every read — plus a
-//! `/metadata` CapabilityStatement.
+//! A FHIR-native EMR core: generic CRUD plus type-level search over any supported
+//! US Core resource type, persisted through a `ChartStore` (SQLite for the real
+//! binary, in-memory for tests), with a governance spine — a `Provenance` written
+//! on every create/update and an append-only `AuditEvent` on every read and
+//! search — plus a `/metadata` CapabilityStatement. The static web frontend is
+//! served from `web/` as a fallback behind the FHIR routes.
 //!
 //! The store keeps each FHIR resource as its whole JSON payload keyed by
 //! `(resourceType, id)` with an integer version, exactly the shape the eventual
@@ -18,12 +19,13 @@ mod store;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
 use serde_json::{json, Value};
+use tower_http::services::ServeDir;
 
 use fhir::{capability_statement, is_supported, operation_outcome};
 use store::{ChartStore, SqliteStore};
@@ -91,6 +93,70 @@ async fn read_resource(
         ),
         Err(e) => server_error(&e.to_string()),
     }
+}
+
+/// GET /:resource_type — list/search, returning a FHIR `Bundle` of type
+/// `searchset`. An optional `?patient=<id>` filters to resources that reference
+/// that patient via either `subject.reference` or `patient.reference` (different
+/// US Core types use different fields).
+async fn search_resources(
+    State(store): State<SharedStore>,
+    Path(resource_type): Path<String>,
+    RawQuery(query): RawQuery,
+) -> (StatusCode, Json<Value>) {
+    if !is_supported(&resource_type) {
+        return unsupported(&resource_type);
+    }
+
+    let patient = query.as_deref().and_then(patient_param);
+
+    let all = match store.list(&resource_type) {
+        Ok(v) => v,
+        Err(e) => return server_error(&e.to_string()),
+    };
+
+    let entries: Vec<Value> = all
+        .into_iter()
+        .filter(|r| match &patient {
+            Some(p) => references_patient(r, p),
+            None => true,
+        })
+        .map(|resource| json!({ "resource": resource }))
+        .collect();
+
+    // Audit the search as one event, then surface the Bundle. As with reads, a
+    // failure to audit must not leak PHI, so it becomes a 500.
+    if let Err(e) = audit::record_audit_search(store.as_ref(), &resource_type, patient.as_deref()) {
+        return server_error(&e.to_string());
+    }
+
+    let bundle = json!({
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "total": entries.len(),
+        "entry": entries,
+    });
+    (StatusCode::OK, Json(bundle))
+}
+
+/// Parse `?patient=<id>` out of a raw query string, if present. Returns the
+/// (percent-literal) id; ids are server-assigned uuids, so no decoding is needed.
+fn patient_param(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        pair.strip_prefix("patient=")
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+    })
+}
+
+/// True if a resource references `Patient/<id>` through either `subject.reference`
+/// or `patient.reference`.
+fn references_patient(resource: &Value, id: &str) -> bool {
+    let target = format!("Patient/{id}");
+    let matches = |field: &str| {
+        resource[field]["reference"].as_str() == Some(target.as_str())
+    };
+    matches("subject") || matches("patient")
 }
 
 /// GET /metadata — the FHIR CapabilityStatement for this server.
@@ -168,12 +234,22 @@ fn server_error(detail: &str) -> (StatusCode, Json<Value>) {
 fn app(store: SharedStore) -> Router {
     Router::new()
         .route("/metadata", get(metadata))
-        .route("/:resource_type", post(create_resource))
+        .route(
+            "/:resource_type",
+            post(create_resource).get(search_resources),
+        )
         .route(
             "/:resource_type/:id",
             get(read_resource).put(update_resource),
         )
+        // Static assets under a reserved literal prefix. A literal segment
+        // (`/static`) wins over the `/:resource_type` param route in axum's
+        // router, so CSS/JS are served here instead of being shadowed by search.
+        .nest_service("/static", ServeDir::new("web"))
         .with_state(store)
+        // Fallback serves `web/index.html` for `GET /` (and any other unmatched
+        // path). The FHIR routes and /static above win first.
+        .fallback_service(ServeDir::new("web"))
 }
 
 #[tokio::main]
@@ -185,8 +261,9 @@ async fn main() {
         .await
         .expect("bind 127.0.0.1:8080");
     println!(
-        "ChartCraft M1 on http://127.0.0.1:8080 \
-         (POST/GET/PUT /:resource_type[/:id], GET /metadata)"
+        "ChartCraft M2 on http://127.0.0.1:8080 \
+         (POST/GET /:resource_type, GET/PUT /:resource_type/:id, \
+         GET /metadata, static web/ at /)"
     );
     axum::serve(listener, app(store)).await.unwrap();
 }
@@ -336,6 +413,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_type_returns_a_searchset_bundle() {
+        let store = mem_store();
+        for family in ["Sharma", "Rao", "Komi"] {
+            let (code, _) = create_resource(
+                State(store.clone()),
+                Path("Patient".into()),
+                Json(json!({"name": [{"family": family}]})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::CREATED);
+        }
+
+        let (code, Json(bundle)) =
+            search_resources(State(store.clone()), Path("Patient".into()), RawQuery(None)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(bundle["resourceType"], "Bundle");
+        assert_eq!(bundle["type"], "searchset");
+        assert_eq!(bundle["total"], 3);
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 3);
+        // Each entry wraps the resource under "resource".
+        assert_eq!(bundle["entry"][0]["resource"]["resourceType"], "Patient");
+    }
+
+    #[tokio::test]
+    async fn patient_filter_matches_subject_and_patient_references() {
+        let store = mem_store();
+
+        // A Condition for Alice via subject.reference (the field Condition uses).
+        store
+            .put(
+                "Condition",
+                "c-alice-subj",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": {"reference": "Patient/alice"},
+                    "code": {"text": "Hypertension"},
+                }),
+            )
+            .unwrap();
+        // A Condition for Alice that instead carries patient.reference — proves we
+        // match BOTH fields, since different resource types populate different ones.
+        store
+            .put(
+                "Condition",
+                "c-alice-pat",
+                &json!({
+                    "resourceType": "Condition",
+                    "patient": {"reference": "Patient/alice"},
+                    "code": {"text": "Diabetes"},
+                }),
+            )
+            .unwrap();
+        // A Condition for a DIFFERENT patient must be excluded.
+        store
+            .put(
+                "Condition",
+                "c-bob",
+                &json!({
+                    "resourceType": "Condition",
+                    "subject": {"reference": "Patient/bob"},
+                    "code": {"text": "Asthma"},
+                }),
+            )
+            .unwrap();
+
+        let (code, Json(bundle)) = search_resources(
+            State(store.clone()),
+            Path("Condition".into()),
+            RawQuery(Some("patient=alice".into())),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(bundle["total"], 2, "both of Alice's Conditions, neither of Bob's");
+
+        // Confirm Bob's Condition is not present.
+        let texts: Vec<&str> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["resource"]["code"]["text"].as_str().unwrap())
+            .collect();
+        assert!(texts.contains(&"Hypertension"));
+        assert!(texts.contains(&"Diabetes"));
+        assert!(!texts.contains(&"Asthma"));
+    }
+
+    #[tokio::test]
+    async fn search_of_unknown_type_is_400() {
+        let store = mem_store();
+        let (code, Json(oo)) =
+            search_resources(State(store), Path("Dragon".into()), RawQuery(None)).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(oo["resourceType"], "OperationOutcome");
+    }
+
+    #[tokio::test]
+    async fn search_records_exactly_one_audit_event() {
+        let store = mem_store();
+        // Two matching resources; the search must still log ONE AuditEvent, not one per hit.
+        for id in ["o1", "o2"] {
+            store
+                .put(
+                    "Observation",
+                    id,
+                    &json!({
+                        "resourceType": "Observation",
+                        "subject": {"reference": "Patient/zed"},
+                    }),
+                )
+                .unwrap();
+        }
+
+        let (code, _) = search_resources(
+            State(store.clone()),
+            Path("Observation".into()),
+            RawQuery(Some("patient=zed".into())),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        let search_events: Vec<Value> = store
+            .list("AuditEvent")
+            .unwrap()
+            .into_iter()
+            .filter(|e| e["action"] == json!("E"))
+            .collect();
+        assert_eq!(
+            search_events.len(),
+            1,
+            "a search records exactly one AuditEvent, not one per matched resource"
+        );
+        assert_eq!(
+            search_events[0]["entity"][0]["what"]["reference"],
+            "Observation?patient=zed"
+        );
+    }
+
+    #[tokio::test]
     async fn metadata_returns_a_capability_statement() {
         let (code, Json(cap)) = metadata().await;
         assert_eq!(code, StatusCode::OK);
@@ -350,6 +565,21 @@ mod tests {
             .collect();
         assert!(types.contains(&"Patient"));
         assert!(types.contains(&"DocumentReference"));
+
+        // M2: every resource must advertise the search-type interaction.
+        for resource in cap["rest"][0]["resource"].as_array().unwrap() {
+            let codes: Vec<&str> = resource["interaction"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["code"].as_str().unwrap())
+                .collect();
+            assert!(
+                codes.contains(&"search-type"),
+                "{} should advertise search-type",
+                resource["type"]
+            );
+        }
     }
 
     /// Audit/provenance records each get a fresh uuid, so they're found by

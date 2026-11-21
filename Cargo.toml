@@ -3,7 +3,7 @@ name = "chartcraft"
 version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Clinician-first, FHIR-native, open-source EMR in Rust (Milestone 1: SQLite persistence, generic FHIR CRUD, Provenance + AuditEvent, /metadata)"
+description = "Clinician-first, FHIR-native, open-source EMR in Rust (Milestone 2: FHIR search + static web serving on top of SQLite persistence, generic FHIR CRUD, Provenance + AuditEvent, /metadata)"
 
 [dependencies]
 axum = "0.7"
@@ -11,3 +11,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+tower-http = { version = "0.5", features = ["fs"] }
