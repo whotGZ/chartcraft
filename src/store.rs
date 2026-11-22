@@ -45,12 +45,16 @@ pub const AUDIT_GENESIS: &str =
 #[derive(Debug)]
 pub enum StoreError {
     Db(String),
+    /// A write would create a second version of an insert-only governance record
+    /// (AuditEvent / Provenance). These are immutable by invariant, not allowlist.
+    ImmutableResource(String),
 }
 
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StoreError::Db(m) => write!(f, "store error: {m}"),
+            StoreError::ImmutableResource(m) => write!(f, "immutable resource: {m}"),
         }
     }
 }
@@ -93,6 +97,15 @@ fn patient_ref_of(payload: &Value) -> Option<String> {
         .as_str()
         .or_else(|| payload["patient"]["reference"].as_str())
         .map(str::to_string)
+}
+
+/// Governance records that are insert-only: every write is version 1 at a fresh
+/// id, never a second version. The immutability invariant lives in the `commit`
+/// mechanism (B1), not in a `SUPPORTED_TYPES` allowlist omission. `AuditEvent` is
+/// the hash-chain's backing store; `Provenance` is the authorship record — both
+/// must be append-only for the audit trail to mean anything.
+fn is_immutable_governance(resource_type: &str) -> bool {
+    matches!(resource_type, "AuditEvent" | "Provenance")
 }
 
 /// SHA-256 of `prev_hash_hex || canonical_json_of_event`, hex-encoded. The event
@@ -141,8 +154,9 @@ pub trait ChartStore: Send + Sync {
 
     /// Current resources of `resource_type` that reference `Patient/<patient_ref>`,
     /// via the promoted+indexed `patient_ref` column — not a full-scan filter.
-    /// The argument is the Patient id; an empty id matches nothing (the reference
-    /// "Patient/" is carried by no resource), preserving the empty-filter contract.
+    /// The argument is the Patient id; an EMPTY id returns nothing by an explicit
+    /// guard (B3), enforcing the empty-filter PHI contract rather than leaving it
+    /// to depend on no resource happening to carry a `Patient/` reference.
     fn find_by_patient(
         &self,
         resource_type: &str,
@@ -199,6 +213,28 @@ impl ChartStore for InMemoryStore {
         }
 
         let mut state = self.state.lock().unwrap();
+
+        // B1: governance records (AuditEvent / Provenance) are insert-only — always
+        // version 1, fresh id. Reject any op that would create version > 1. Unlike
+        // SQLite (whose per-op `next` catches this for free), the in-memory loop
+        // mutates incrementally with no rollback, so this guard must run in the
+        // pre-mutation pass WITH the lock held, and must also catch an intra-batch
+        // duplicate id that the store doesn't yet know about.
+        // Keyed on the full `type/id` (matching SQLite's per-(type,id) `next`), so
+        // a batch with both AuditEvent/x and Provenance/x is NOT falsely rejected.
+        let mut seen_in_batch: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for op in ops {
+            if is_immutable_governance(&op.resource_type) {
+                let key = format!("{}/{}", op.resource_type, op.id);
+                if state.data.contains_key(&key) || !seen_in_batch.insert(key.clone()) {
+                    return Err(StoreError::ImmutableResource(format!(
+                        "{} is insert-only; cannot create a second version of {key}",
+                        op.resource_type
+                    )));
+                }
+            }
+        }
+
         let mut versions = Vec::with_capacity(ops.len());
         for op in ops {
             let key = format!("{}/{}", op.resource_type, op.id);
@@ -267,6 +303,11 @@ impl ChartStore for InMemoryStore {
         resource_type: &str,
         patient_id: &str,
     ) -> Result<Vec<Value>, StoreError> {
+        // B3: an empty patient id returns nothing, explicitly — never every
+        // patient's data. The PHI boundary is enforced here, not left incidental.
+        if patient_id.is_empty() {
+            return Ok(vec![]);
+        }
         let prefix = format!("{resource_type}/");
         let target = format!("Patient/{patient_id}");
         let state = self.state.lock().unwrap();
@@ -389,6 +430,17 @@ impl ChartStore for SqliteStore {
                 rusqlite::params![op.resource_type, op.id],
                 |row| row.get(0),
             )?;
+            // B1: governance records are insert-only — version 1, fresh id. A
+            // `next > 1` here means this id already has a version, so reject before
+            // mutating. Returning early drops `tx`, which rolls the whole batch back
+            // (an intra-batch dup also hits this: the first op inserts, the second
+            // sees MAX=1 → next=2 → Err), so a violating batch persists nothing.
+            if is_immutable_governance(&op.resource_type) && next > 1 {
+                return Err(StoreError::ImmutableResource(format!(
+                    "{} is insert-only; cannot create version {next} of {}/{}",
+                    op.resource_type, op.resource_type, op.id
+                )));
+            }
             // Demote the previous current row (if any) — never an UPDATE of payload.
             tx.execute(
                 "UPDATE resources SET is_current = 0
@@ -485,6 +537,10 @@ impl ChartStore for SqliteStore {
         resource_type: &str,
         patient_id: &str,
     ) -> Result<Vec<Value>, StoreError> {
+        // B3: an empty patient id returns nothing, explicitly (see trait doc).
+        if patient_id.is_empty() {
+            return Ok(vec![]);
+        }
         let target = format!("Patient/{patient_id}");
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -772,6 +828,79 @@ mod tests {
             assert_eq!(store.find_by_patient("Condition", "bob").unwrap().len(), 1);
             // Empty id → "Patient/" → matches nothing (empty-filter contract).
             assert_eq!(store.find_by_patient("Condition", "").unwrap().len(), 0);
+        }
+    }
+
+    /// B1: a second write to an existing AuditEvent id is rejected, nothing from
+    /// the violating batch persists, and the audit chain stays intact — in both
+    /// backends. The violating op comes AFTER a valid op to prove the in-memory
+    /// backend doesn't leak the earlier mutation.
+    #[test]
+    fn audit_event_is_insert_only_and_batch_rolls_back() {
+        for store in backends() {
+            // Seed one legitimate AuditEvent (version 1).
+            store
+                .commit(&[WriteOp::new(
+                    "AuditEvent",
+                    "a1",
+                    json!({"resourceType": "AuditEvent", "action": "R"}),
+                )])
+                .unwrap();
+            assert!(store.verify_audit_chain().unwrap());
+
+            // A batch: a valid Patient write, then an illegal SECOND version of a1.
+            let batch = vec![
+                WriteOp::new("Patient", "p-rollback", json!({"resourceType": "Patient"})),
+                WriteOp::new(
+                    "AuditEvent",
+                    "a1",
+                    json!({"resourceType": "AuditEvent", "action": "TAMPER"}),
+                ),
+            ];
+            assert!(
+                matches!(store.commit(&batch), Err(StoreError::ImmutableResource(_))),
+                "a second version of an AuditEvent id must be rejected"
+            );
+
+            // Nothing from the violating batch persisted (not even the earlier op).
+            assert!(
+                store.get("Patient", "p-rollback").unwrap().is_none(),
+                "the valid op in a rejected batch must not persist"
+            );
+            // a1 is untouched: still version 1, still the original payload.
+            assert_eq!(store.history("AuditEvent", "a1").unwrap().len(), 1);
+            assert_eq!(store.get("AuditEvent", "a1").unwrap().unwrap()["action"], "R");
+
+            // A normal audited op still succeeds and the chain stays verifiable.
+            store
+                .commit(&[WriteOp::new(
+                    "AuditEvent",
+                    "a2",
+                    json!({"resourceType": "AuditEvent", "action": "R"}),
+                )])
+                .unwrap();
+            assert!(store.verify_audit_chain().unwrap(), "chain intact after a legit write");
+        }
+    }
+
+    /// B3: find_by_patient("", ...) returns empty EVEN WHEN a resource carries an
+    /// empty `Patient/` reference — the guard, not the data, enforces the boundary.
+    #[test]
+    fn find_by_patient_empty_id_returns_nothing_even_with_patient_slash_row() {
+        for store in backends() {
+            // An adversarial row whose promoted patient_ref is exactly "Patient/".
+            store
+                .put(
+                    "Condition",
+                    "c-empty-ref",
+                    &json!({"resourceType": "Condition", "subject": {"reference": "Patient/"}}),
+                )
+                .unwrap();
+            assert_eq!(
+                store.find_by_patient("Condition", "").unwrap().len(),
+                0,
+                "empty patient id must return nothing even with a Patient/ reference present"
+            );
         }
     }
 

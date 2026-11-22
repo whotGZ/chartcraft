@@ -1,16 +1,20 @@
-//! ChartCraft — Milestone 3.
+//! ChartCraft — FHIR-native EMR core.
 //!
-//! A FHIR-native EMR core: generic CRUD plus type-level search over any supported
-//! US Core resource type, persisted through a `ChartStore` (SQLite for the real
-//! binary, in-memory for tests), with a governance spine — a `Provenance` written
-//! on every create/update and an append-only `AuditEvent` on every read and
-//! search — plus a `/metadata` CapabilityStatement. The static web frontend is
-//! served from `web/` as a fallback behind the FHIR routes.
+//! Generic CRUD plus type-level search over any supported US Core resource type,
+//! persisted through a `ChartStore` (SQLite for the real binary, in-memory for
+//! tests), with a governance spine — a `Provenance` and an `AuditEvent` on every
+//! create/update, an `AuditEvent` on every read and search — plus a `/metadata`
+//! CapabilityStatement. The static web frontend is served from `web/` as a
+//! fallback behind the FHIR routes.
 //!
-//! The store keeps each FHIR resource as its whole JSON payload keyed by
-//! `(resourceType, id)` with an integer version, exactly the shape the eventual
-//! Postgres backend will take (JSONB payload + promoted columns), so swapping
-//! stores is implementing a trait, not a rewrite.
+//! The store is append-only and versioned: a write never overwrites: it appends a
+//! new version and retains the old (history is preserved). A single atomic
+//! `commit(&[WriteOp])` is the ONE write path, so a clinical resource and its
+//! Provenance + AuditEvent persist all-or-nothing. Every `AuditEvent` is linked
+//! into a SHA-256 hash chain that `verify_audit_chain` can recompute end-to-end,
+//! and governance records (AuditEvent/Provenance) are insert-only. Patient-scoped
+//! queries go through `find_by_patient` over a promoted, indexed `patient_ref`
+//! column. Auth and encryption are still pending (M4).
 
 mod audit;
 mod fhir;
@@ -119,8 +123,9 @@ async fn search_resources(
     // The `?patient=` path goes through the indexed `find_by_patient` primitive
     // (promoted `patient_ref` column) instead of list()+in-handler filter; the
     // no-filter picker case keeps list(). An empty `patient=` → `Some("")` →
-    // find_by_patient(type, "") matches nothing, preserving the empty-filter
-    // contract that an empty patient filter returns an empty searchset.
+    // find_by_patient(type, "") returns empty by an explicit guard (B3), so an
+    // empty patient filter returns an empty searchset — the PHI boundary is
+    // enforced in the store, not left to depend on the data.
     let resources = match &patient {
         Some(p) => store.find_by_patient(&resource_type, p),
         None => store.list(&resource_type),
@@ -157,8 +162,8 @@ async fn search_resources(
 fn patient_param(query: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         // A present-but-empty `patient=` must NOT be dropped: a `Some("")` flows
-        // through to `find_by_patient(type, "")`, which targets "Patient/" and
-        // matches nothing — so an empty filter returns an empty searchset, not
+        // through to `find_by_patient(type, "")`, which returns empty by an
+        // explicit guard (B3) — so an empty filter returns an empty searchset, not
         // every patient's resources. Dropping it here would re-open that
         // cross-patient PHI overexposure. Only a wholly absent param → None.
         pair.strip_prefix("patient=").map(|v| v.to_string())
@@ -301,32 +306,39 @@ fn write(
     id: &str,
     body: &Value,
 ) -> (StatusCode, Json<Value>) {
-    // ponytail: C/U and 201/200 are decided pre-commit via a separate get(), so
-    // the get+commit pair isn't atomic — two concurrent first-PUTs to the same id
-    // could both see "create" and both log "C"/201. Acceptable until auth/M4; a
-    // single transactional "insert-and-report-whether-it-created" would close it.
+    // The "C"/"U" AUDIT LABEL is baked into the audit WriteOp before `commit`
+    // runs (before the version is known), so it's still decided from a pre-commit
+    // get(): a fresh id → create, an existing one → update.
     //
-    // Whether this is a create (C / 201) or an update (U / 200) is decided BEFORE
-    // the write, since the audit action is part of the same atomic batch. A fresh
-    // id has no current version yet → create; an existing one → update.
+    // ponytail: the C/U audit LABEL can still be wrong under a concurrent
+    // first-write race — two first-PUTs to the same id could both read "no current
+    // version" and both log "C". The HTTP STATUS below is now race-free (derived
+    // from the version commit returns), but fully fixing the label needs the audit
+    // op to learn its version after commit, which means restructuring the write
+    // path — an M4 (auth) concern. Status is fixed now; label defers to M4.
     let is_create = match store.get(resource_type, id) {
         Ok(existing) => existing.is_none(),
         Err(e) => return server_error(&e.to_string()),
     };
     let action = if is_create { "C" } else { "U" };
 
-    // Resource + Provenance + AuditEvent persist together or not at all.
+    // Resource + Provenance + AuditEvent persist together or not at all. The
+    // resource op is batch[0], so versions[0] is its committed version.
     let batch = vec![
         WriteOp::new(resource_type, id, body.clone()),
         audit::provenance_op(resource_type, id),
         audit::audit_write_op(resource_type, id, action),
     ];
-    if let Err(e) = store.commit(&batch) {
-        return server_error(&e.to_string());
-    }
+    let versions = match store.commit(&batch) {
+        Ok(v) => v,
+        Err(e) => return server_error(&e.to_string()),
+    };
 
-    // FHIR: 201 when this write created the resource, 200 when it updated one.
-    let code = if is_create {
+    // FHIR: 201 when this write CREATED the resource, 200 when it updated one.
+    // Derived from the version `commit` actually assigned (version 1 → created),
+    // computed AFTER the commit — so the status can't disagree with what persisted,
+    // even if a concurrent first-write raced the pre-commit get() above.
+    let code = if versions[0] == 1 {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -508,6 +520,31 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
+    }
+
+    /// B2: the HTTP status is driven by the version `commit` returns — version 1
+    /// → 201 Created, a later version → 200 OK — not by the racy pre-commit get().
+    #[tokio::test]
+    async fn write_status_follows_committed_version() {
+        let store = mem_store();
+
+        // First write at a fresh id commits version 1 → 201.
+        let (code, _) = update_resource(
+            State(store.clone()),
+            Path(("Observation".into(), "ob-b2".into())),
+            Json(json!({"status": "final"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "version 1 → 201");
+
+        // Second write at the same id commits version 2 → 200.
+        let (code, _) = update_resource(
+            State(store.clone()),
+            Path(("Observation".into(), "ob-b2".into())),
+            Json(json!({"status": "amended"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "version 2 → 200");
     }
 
     #[tokio::test]

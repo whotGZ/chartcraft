@@ -2,7 +2,7 @@
 
 **An open-source electronic medical record, rebuilt in Rust, designed by a doctor who actually uses one.**
 
-Status: pre-alpha. A working FHIR core and clinician UI exist (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)), but the HIPAA safeguards — authentication, encryption at rest, tamper-evident audit — are the *next* milestone and are **not built yet**. **Do not put real patient data in it today.** Use synthetic or de-identified data only until M4 lands. Contributors welcome from line one.
+Status: pre-alpha. A working FHIR core, a clinician UI, and an append-only, hash-chained (tamper-evident) audit log already exist (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). The remaining HIPAA safeguards — **authentication** and **encryption at rest** — are the *next* milestone (M4) and are **not built yet**. **Do not put real patient data in it today.** Use synthetic or de-identified data only until M4 lands. Contributors welcome from line one.
 
 ---
 
@@ -23,7 +23,7 @@ ChartCraft is clinician-first, local-first, FHIR-native, and free.
 3. **Local-first and self-hostable.** A solo physician runs it on one box. A clinic runs it on a server they own. Your patients' data is not rent you pay forever. Single Rust binary + Postgres (or SQLite for solo).
 4. **AI-native, clinician-in-the-loop.** The design intent: ambient scribe, structured extraction, order drafting, chart summarization — drafted by agents, *signed by a human*, with every AI action recorded as attributable, reversible `Provenance`. The AI surfaces and real human signing arrive with auth (M4); today a `Provenance` is written on every change but the signer is a placeholder.
 5. **Fast.** Rust, because a note should open in the time it takes to look up from the patient, not the time it takes to get coffee.
-6. **Auditable and private.** Designed around an append-only audit log and HIPAA technical safeguards (authentication, encryption at rest, tamper-evident audit). Those safeguards are the current build focus (M4), not yet complete. No telemetry home (verified: loopback-only bind, same-origin UI).
+6. **Auditable and private.** An append-only, hash-chained audit log already exists — altered or removed entries are detectable (`verify_audit_chain`), and every write commits its resource, `Provenance`, and `AuditEvent` atomically. The remaining safeguards, authentication and encryption at rest, are the current build focus (M4). No telemetry home (verified: loopback-only bind, same-origin UI).
 
 ## The shape of the MVP
 
@@ -40,7 +40,7 @@ The wedge is the **note**. The thing a clinician actually fights the EMR over is
 
 ## What this is — and isn't — yet
 
-What it is *designed to be*: software a direct-pay physician can legally run as their own medical record. There is no federal law requiring an EMR to be *certified* for a clinician to document care in it; what applies is HIPAA and state record law. That legal path is open — but *legally permitted* is not the same as *technically ready*. The HIPAA technical safeguards (auth, encryption, tamper-evident audit) are M4 and unbuilt, so ChartCraft is **not ready for real patient charts yet**. When those land, the first real user can be a physician signing their own charts.
+What it is *designed to be*: software a direct-pay physician can legally run as their own medical record. There is no federal law requiring an EMR to be *certified* for a clinician to document care in it; what applies is HIPAA and state record law. That legal path is open — but *legally permitted* is not the same as *technically ready*. The tamper-evident audit spine exists, but the remaining HIPAA technical safeguards (authentication, encryption at rest) are M4 and unbuilt, so ChartCraft is **not ready for real patient charts yet**. When those land, the first real user can be a physician signing their own charts.
 
 What it isn't: ONC-certified. That certification is **voluntary** and gates CMS/MIPS participation and hospital procurement, not patient care itself. It is a months-long public process we climb in the open. See [`docs/REGULATORY.md`](docs/REGULATORY.md) for the two tiers.
 
