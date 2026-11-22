@@ -1,22 +1,22 @@
 //! The governance spine: a `Provenance` on every write, an `AuditEvent` on
-//! every read. Both are written through the same `ChartStore` so they persist,
-//! and both get a fresh uuid every time — the audit log is append-only.
+//! every read/search/write. These are the BUILDERS — each returns a `WriteOp`
+//! (and a fresh uuid per call, keeping the audit log append-only). The handler
+//! composes them into ONE atomic `commit`, so a resource and its governance
+//! records persist all-or-nothing. The hash-chaining of AuditEvents happens in
+//! the store's `commit`, not here, so every path that writes an AuditEvent is
+//! chained by construction.
 
 use serde_json::json;
 
 use crate::fhir::now_iso8601;
-use crate::store::{ChartStore, StoreError};
+use crate::store::WriteOp;
 
 // ponytail: real cryptographic signing (and the signer's identity) arrives with
 // auth in M4. For now every write is attributed to this fixed demo agent.
 const SIGNER_LABEL: &str = "ChartCraft (unsigned demo)";
 
-/// Record a `Provenance` resource targeting a written resource.
-pub fn record_provenance(
-    store: &dyn ChartStore,
-    resource_type: &str,
-    id: &str,
-) -> Result<(), StoreError> {
+/// Build a `Provenance` WriteOp targeting a written resource.
+pub fn provenance_op(resource_type: &str, id: &str) -> WriteOp {
     let prov_id = uuid::Uuid::new_v4().to_string();
     let provenance = json!({
         "resourceType": "Provenance",
@@ -27,22 +27,15 @@ pub fn record_provenance(
             "who": {"display": SIGNER_LABEL},
         }],
     });
-    store.put("Provenance", &prov_id, &provenance)?;
-    Ok(())
+    WriteOp::new("Provenance", &prov_id, provenance)
 }
 
-/// Append an `AuditEvent` recording a search over a clinical resource type.
+/// Build an `AuditEvent` WriteOp for a search over a clinical resource type.
 ///
 /// ponytail: ONE AuditEvent per search, not one per matched resource — the
 /// audited event is "a query ran", and its scope is the type (+ optional patient
-/// filter), not each row returned. We also don't guard against auditing searches
-/// of AuditEvent/Provenance here: those types aren't in SUPPORTED_TYPES, so the
-/// handler 400s before ever reaching this function, making the guard moot.
-pub fn record_audit_search(
-    store: &dyn ChartStore,
-    resource_type: &str,
-    patient: Option<&str>,
-) -> Result<(), StoreError> {
+/// filter), not each row returned.
+pub fn audit_search_op(resource_type: &str, patient: Option<&str>) -> WriteOp {
     let event_id = uuid::Uuid::new_v4().to_string();
     let query = match patient {
         Some(p) => format!("{resource_type}?patient={p}"),
@@ -56,20 +49,14 @@ pub fn record_audit_search(
         "recorded": now_iso8601(),
         "entity": [{"what": {"reference": query}}],
     });
-    store.put("AuditEvent", &event_id, &event)?;
-    Ok(())
+    WriteOp::new("AuditEvent", &event_id, event)
 }
 
-/// Append an `AuditEvent` recording a write (create/update) of a clinical
+/// Build an `AuditEvent` WriteOp for a write (create/update) of a clinical
 /// resource. `action` is the FHIR AuditEvent code: `"C"` (create) or `"U"`
-/// (update). Mirrors `record_audit_read` — a write is a PHI touch too, so it
-/// must be audited, not just attributed via Provenance.
-pub fn record_audit_write(
-    store: &dyn ChartStore,
-    resource_type: &str,
-    id: &str,
-    action: &str,
-) -> Result<(), StoreError> {
+/// (update). A write is a PHI touch too, so it must be audited, not just
+/// attributed via Provenance.
+pub fn audit_write_op(resource_type: &str, id: &str, action: &str) -> WriteOp {
     let event_id = uuid::Uuid::new_v4().to_string();
     let event = json!({
         "resourceType": "AuditEvent",
@@ -78,16 +65,12 @@ pub fn record_audit_write(
         "recorded": now_iso8601(),
         "entity": [{"what": {"reference": format!("{resource_type}/{id}")}}],
     });
-    store.put("AuditEvent", &event_id, &event)?;
-    Ok(())
+    WriteOp::new("AuditEvent", &event_id, event)
 }
 
-/// Append an `AuditEvent` recording a successful read of a clinical resource.
-pub fn record_audit_read(
-    store: &dyn ChartStore,
-    resource_type: &str,
-    id: &str,
-) -> Result<(), StoreError> {
+/// Build an `AuditEvent` WriteOp recording a successful read of a clinical
+/// resource.
+pub fn audit_read_op(resource_type: &str, id: &str) -> WriteOp {
     let event_id = uuid::Uuid::new_v4().to_string();
     let event = json!({
         "resourceType": "AuditEvent",
@@ -96,6 +79,5 @@ pub fn record_audit_read(
         "recorded": now_iso8601(),
         "entity": [{"what": {"reference": format!("{resource_type}/{id}")}}],
     });
-    store.put("AuditEvent", &event_id, &event)?;
-    Ok(())
+    WriteOp::new("AuditEvent", &event_id, event)
 }

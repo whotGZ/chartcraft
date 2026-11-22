@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
 use fhir::{capability_statement, is_supported, now_iso8601, operation_outcome};
-use store::{ChartStore, SqliteStore};
+use store::{ChartStore, SqliteStore, WriteOp};
 
 type SharedStore = Arc<dyn ChartStore>;
 
@@ -84,7 +84,7 @@ async fn read_resource(
         Ok(Some(resource)) => {
             // Append-only audit of the read. A failure to audit must not leak PHI,
             // so surface it as a 500 rather than returning the resource unlogged.
-            if let Err(e) = audit::record_audit_read(store.as_ref(), &resource_type, &id) {
+            if let Err(e) = store.commit(&[audit::audit_read_op(&resource_type, &id)]) {
                 return server_error(&e.to_string());
             }
             (StatusCode::OK, Json(resource))
@@ -116,23 +116,30 @@ async fn search_resources(
 
     let patient = query.as_deref().and_then(patient_param);
 
-    let all = match store.list(&resource_type) {
+    // The `?patient=` path goes through the indexed `find_by_patient` primitive
+    // (promoted `patient_ref` column) instead of list()+in-handler filter; the
+    // no-filter picker case keeps list(). An empty `patient=` → `Some("")` →
+    // find_by_patient(type, "") matches nothing, preserving the empty-filter
+    // contract that an empty patient filter returns an empty searchset.
+    let resources = match &patient {
+        Some(p) => store.find_by_patient(&resource_type, p),
+        None => store.list(&resource_type),
+    };
+    let resources = match resources {
         Ok(v) => v,
         Err(e) => return server_error(&e.to_string()),
     };
 
-    let entries: Vec<Value> = all
+    let entries: Vec<Value> = resources
         .into_iter()
-        .filter(|r| match &patient {
-            Some(p) => references_patient(r, p),
-            None => true,
-        })
         .map(|resource| json!({ "resource": resource }))
         .collect();
 
     // Audit the search as one event, then surface the Bundle. As with reads, a
     // failure to audit must not leak PHI, so it becomes a 500.
-    if let Err(e) = audit::record_audit_search(store.as_ref(), &resource_type, patient.as_deref()) {
+    if let Err(e) =
+        store.commit(&[audit::audit_search_op(&resource_type, patient.as_deref())])
+    {
         return server_error(&e.to_string());
     }
 
@@ -150,22 +157,12 @@ async fn search_resources(
 fn patient_param(query: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         // A present-but-empty `patient=` must NOT be dropped: a `Some("")` flows
-        // through to `references_patient`, which builds target "Patient/" and
+        // through to `find_by_patient(type, "")`, which targets "Patient/" and
         // matches nothing — so an empty filter returns an empty searchset, not
         // every patient's resources. Dropping it here would re-open that
         // cross-patient PHI overexposure. Only a wholly absent param → None.
         pair.strip_prefix("patient=").map(|v| v.to_string())
     })
-}
-
-/// True if a resource references `Patient/<id>` through either `subject.reference`
-/// or `patient.reference`.
-fn references_patient(resource: &Value, id: &str) -> bool {
-    let target = format!("Patient/{id}");
-    let matches = |field: &str| {
-        resource[field]["reference"].as_str() == Some(target.as_str())
-    };
-    matches("subject") || matches("patient")
 }
 
 /// True if a Condition belongs on a billable "active problem list": clinically
@@ -213,22 +210,24 @@ async fn superbill(
         Err(e) => return server_error(&e.to_string()),
     };
 
-    // Diagnoses: the patient's Conditions, matched with the SAME helper the
-    // search handler uses (subject.reference OR patient.reference == Patient/id).
-    let conditions = match store.list("Condition") {
+    // Diagnoses: the patient's Conditions, fetched through the indexed
+    // `find_by_patient` primitive (promoted patient_ref), then narrowed to the
+    // billable active problem list in-handler. The index handles *whose*
+    // Conditions; is_billable_condition handles *which* of them bill.
+    let conditions = match store.find_by_patient("Condition", &id) {
         Ok(v) => v,
         Err(e) => return server_error(&e.to_string()),
     };
     let diagnoses: Vec<Value> = conditions
         .into_iter()
-        .filter(|c| references_patient(c, &id) && is_billable_condition(c))
+        .filter(is_billable_condition)
         .map(|c| json!({ "text": c["code"]["text"] }))
         .collect();
 
-    // Audit the PHI read before returning data, reusing the read helper. The
-    // `<id>/$superbill` entity distinguishes a superbill read from a plain read.
-    // Auditing failure is a 500, never a body returned unlogged (matches reads).
-    if let Err(e) = audit::record_audit_read(store.as_ref(), "Patient", &format!("{id}/$superbill"))
+    // Audit the PHI read before returning data. The `<id>/$superbill` entity
+    // distinguishes a superbill read from a plain read. Auditing failure is a
+    // 500, never a body returned unlogged (matches reads).
+    if let Err(e) = store.commit(&[audit::audit_read_op("Patient", &format!("{id}/$superbill"))])
     {
         return server_error(&e.to_string());
     }
@@ -292,30 +291,42 @@ async fn metadata() -> (StatusCode, Json<Value>) {
 
 // --- shared handler logic ---------------------------------------------------
 
-/// Validate the type, store the resource, and record its Provenance. Returns the
-/// 201 + resource on success, or the appropriate OperationOutcome error.
+/// Validate the type, then persist the resource, its Provenance, and its
+/// AuditEvent in ONE atomic `commit` — all-or-nothing, so a resource is never
+/// left without its governance records. Returns 201 on create / 200 on update,
+/// or an OperationOutcome error.
 fn write(
     store: &SharedStore,
     resource_type: &str,
     id: &str,
     body: &Value,
 ) -> (StatusCode, Json<Value>) {
-    let version = match store.put(resource_type, id, body) {
-        Ok(v) => v,
+    // ponytail: C/U and 201/200 are decided pre-commit via a separate get(), so
+    // the get+commit pair isn't atomic — two concurrent first-PUTs to the same id
+    // could both see "create" and both log "C"/201. Acceptable until auth/M4; a
+    // single transactional "insert-and-report-whether-it-created" would close it.
+    //
+    // Whether this is a create (C / 201) or an update (U / 200) is decided BEFORE
+    // the write, since the audit action is part of the same atomic batch. A fresh
+    // id has no current version yet → create; an existing one → update.
+    let is_create = match store.get(resource_type, id) {
+        Ok(existing) => existing.is_none(),
         Err(e) => return server_error(&e.to_string()),
     };
-    if let Err(e) = audit::record_provenance(store.as_ref(), resource_type, id) {
+    let action = if is_create { "C" } else { "U" };
+
+    // Resource + Provenance + AuditEvent persist together or not at all.
+    let batch = vec![
+        WriteOp::new(resource_type, id, body.clone()),
+        audit::provenance_op(resource_type, id),
+        audit::audit_write_op(resource_type, id, action),
+    ];
+    if let Err(e) = store.commit(&batch) {
         return server_error(&e.to_string());
     }
-    // A write is a PHI touch, so it must be audited too (Provenance attributes,
-    // AuditEvent logs the access). "C" on a create (version 1), "U" on update.
-    // As with reads, a failure to audit must not return a body unlogged — 500.
-    let action = if version == 1 { "C" } else { "U" };
-    if let Err(e) = audit::record_audit_write(store.as_ref(), resource_type, id, action) {
-        return server_error(&e.to_string());
-    }
+
     // FHIR: 201 when this write created the resource, 200 when it updated one.
-    let code = if version == 1 {
+    let code = if is_create {
         StatusCode::CREATED
     } else {
         StatusCode::OK
