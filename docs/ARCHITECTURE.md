@@ -38,6 +38,18 @@ Two deliverables: the first *view* on the FHIR data that isn't generic CRUD — 
 
 Still not built: the Postgres backend, auth, real signing, MDM-based E/M leveling, an ambient-scribe / AI drafting UI on top of the note engine, and everything under *AI, done responsibly*.
 
+## Milestone 4 — authentication (in progress)
+
+The security gate that turns the governance spine honest: PHI is now behind a login, and the Provenance signer / AuditEvent actor is the *real* logged-in user instead of a fixed demo label.
+
+- **Local password login:** `POST /auth/register` (BOOTSTRAP ONLY — allowed only when zero users exist, creates the first admin and auto-logs-in; `403` once any user exists), `POST /auth/login` (generic `401` on failure, no username-vs-password enumeration), `POST /auth/logout` (`204`, clears the cookie), `GET /auth/me` (current user or `401`). Passwords are hashed with **argon2id** (library-default params) into PHC strings — plaintext is never stored or logged.
+- **Server-side sessions:** a 256-bit cryptographically-random token (`rand`, hex-encoded) rides an `HttpOnly; SameSite=Strict; Path=/` cookie and maps back to the user through an in-memory `Mutex<HashMap>`. (`Secure` is deliberately omitted for `http://localhost` dev — it MUST be enabled behind TLS in production. Sessions are lost on restart, acceptable for a solo single-box deploy.)
+- **Access control:** an axum `AuthPrincipal` extractor resolves the session cookie; every FHIR data endpoint (`POST/GET /:type`, `GET/PUT /:type/:id`, `$superbill`, `/metadata`) now takes it and so returns `401` + an `OperationOutcome` without a valid session. `/auth/*`, `GET /` (UI shell), and `/static/*` (assets) stay reachable logged-out so the login page can load.
+- **Clean store separation:** users live in their own `users` table (`username` UNIQUE, argon2 hash, display name, id, created) with its own `AuthStore` seam + SQLite/in-memory backends — never in the FHIR `resources` table, never a FHIR resource. `SqliteAuthStore` shares the `chartcraft.db` *file* but owns its own connection.
+- **Real signer into the spine:** the `audit.rs` builders now take the `Principal`; every Provenance `agent.who` and AuditEvent actor records the logged-in user's display name + id.
+
+Still pending for M4: **TOTP MFA** and **encryption-at-rest**. Still not built beyond M4: the Postgres backend, SMART-on-FHIR/OAuth2, MDM-based E/M leveling, and everything under *AI, done responsibly*.
+
 ## The one idea
 
 **The data model is FHIR. Everything else is a view on it.**

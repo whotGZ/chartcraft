@@ -24,12 +24,66 @@
     <div class="topbar-actions">
       <span id="conn-status" class="conn" title="API connection"></span>
       <button id="btn-sample" class="btn btn-primary" type="button">Load sample patient</button>
+      <span id="user-name" class="user-name" hidden></span>
+      <button id="btn-logout" class="btn btn-sm" type="button" hidden>Log out</button>
     </div>
   </header>
 
   <div id="banner" class="banner" hidden></div>
 
-  <main class="layout">
+  <!-- Login / auth gate -->
+  <section id="login-screen" class="login-screen" hidden aria-label="Sign in">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 3h6a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v0a2 2 0 0 1 2-2z" />
+            <path d="M7 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" />
+            <path d="M12 11v6M9 14h6" />
+          </svg>
+        </span>
+        <span class="login-wordmark">ChartCraft</span>
+      </div>
+
+      <div id="login-msg" class="login-msg" hidden></div>
+
+      <!-- Sign in -->
+      <form id="login-form" class="login-form">
+        <h1 class="login-title">Sign in</h1>
+        <label class="field login-field">
+          <span class="field-label">Username</span>
+          <input id="login-username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required />
+        </label>
+        <label class="field login-field">
+          <span class="field-label">Password</span>
+          <input id="login-password" type="password" autocomplete="current-password" required />
+        </label>
+        <button id="btn-login" class="btn btn-primary login-submit" type="submit">Sign in</button>
+        <button id="link-show-register" class="login-link" type="button">First time? Create the admin account</button>
+      </form>
+
+      <!-- First-run register (hidden until revealed) -->
+      <form id="register-form" class="login-form" hidden>
+        <h1 class="login-title">Create admin account</h1>
+        <label class="field login-field">
+          <span class="field-label">Username</span>
+          <input id="register-username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required />
+        </label>
+        <label class="field login-field">
+          <span class="field-label">Password</span>
+          <input id="register-password" type="password" autocomplete="new-password" required />
+        </label>
+        <label class="field login-field">
+          <span class="field-label">Display name</span>
+          <input id="register-displayname" type="text" autocomplete="name" required />
+        </label>
+        <button id="btn-register" class="btn btn-primary login-submit" type="submit">Create account</button>
+        <button id="link-show-login" class="login-link" type="button">Already have an account? Sign in</button>
+      </form>
+    </div>
+  </section>
+
+  <main class="layout" id="app-layout" hidden>
     <aside class="sidebar">
       <div class="sidebar-head">
         <h2>Patients</h2>

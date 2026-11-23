@@ -19,8 +19,21 @@ let patients = [];
 let selectedId = null;
 
 /* ---------- fetch helpers ---------- */
+/* Raised when a data request comes back 401 — the session is gone. Callers
+   should swallow it quietly (the session-expired bounce already ran) rather
+   than painting their own error over the login screen. */
+function authError(path) {
+  const e = new Error(`Unauthorized: ${path}`);
+  e.isAuth = true;
+  return e;
+}
+
 async function apiGet(path) {
-  const res = await fetch(API + path, { headers: { Accept: "application/json" } });
+  const res = await fetch(API + path, {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  });
+  if (res.status === 401) { handleSessionExpired(); throw authError(path); }
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json();
 }
@@ -28,9 +41,11 @@ async function apiGet(path) {
 async function apiPost(type, resource) {
   const res = await fetch(API + "/" + type, {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(resource),
   });
+  if (res.status === 401) { handleSessionExpired(); throw authError("/" + type); }
   if (!res.ok) throw new Error(`POST /${type} → ${res.status}`);
   return res.json();
 }
@@ -352,6 +367,7 @@ async function loadPatients() {
       selectPatient(patients[0].id);
     }
   } catch (err) {
+    if (err && err.isAuth) return; // session-expired bounce already handled
     setConn(false);
     showBanner("Could not reach the ChartCraft API. Is the server running? " + err.message, "err");
   }
@@ -395,6 +411,7 @@ async function selectPatient(id) {
     renderChart(patient, entries(condB), entries(medB), entries(algB), entries(obsB));
     renderNotes(entries(docB));
   } catch (err) {
+    if (err && err.isAuth) return; // session-expired bounce already handled
     showBanner("Could not load this patient's chart. " + err.message, "err");
   }
 }
@@ -559,6 +576,7 @@ async function saveNote() {
     renderNotes(entries(docB));
     openNote(saved && saved.resourceType ? saved : body);
   } catch (err) {
+    if (err && err.isAuth) return; // session-expired bounce already handled
     $("#note-save-msg").textContent = "Could not save: " + err.message;
   } finally {
     btn.disabled = false;
@@ -650,7 +668,9 @@ async function loadSamplePatient() {
     await selectPatient(pid);
     hideBanner();
   } catch (err) {
-    showBanner("Could not create the sample patient. " + err.message, "err");
+    if (!(err && err.isAuth)) { // session-expired bounce already handled
+      showBanner("Could not create the sample patient. " + err.message, "err");
+    }
   } finally {
     btns.forEach((b) => b && (b.disabled = false));
   }
@@ -757,6 +777,7 @@ async function generateSuperbill() {
     const data = await apiGet("/Patient/" + encodeURIComponent(selectedId) + "/$superbill");
     renderSuperbill(data);
   } catch (err) {
+    if (err && err.isAuth) { closeSuperbill(); return; } // bounced to login
     const notFound = /→\s*404/.test(err.message);
     renderSuperbillError(
       notFound
@@ -771,6 +792,195 @@ function printSuperbill() {
   window.print();
   // cleanup after the print dialog closes
   setTimeout(() => document.body.classList.remove("printing-superbill"), 0);
+}
+
+/* ---------- auth / login gate ---------- */
+let currentUser = null;
+
+/* Dedicated fetch for /auth/* — unlike apiGet/apiPost, a 401 here is expected
+   (logged-out on load, or bad credentials) and must NOT trigger the
+   session-expired bounce. Returns the raw Response so callers can branch on
+   status (204 logout has no JSON body). */
+function authFetch(path, body) {
+  const opts = {
+    credentials: "same-origin",
+    headers: { Accept: "application/json" },
+  };
+  if (body !== undefined) {
+    opts.method = "POST";
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(API + path, opts);
+}
+
+function showLoginMsg(msg, kind) {
+  const m = $("#login-msg");
+  if (!m) return;
+  m.textContent = msg || "";
+  m.className = "login-msg" + (kind ? " " + kind : "");
+  m.hidden = !msg;
+}
+
+/* Swap to the login screen and tear down any in-memory patient state so one
+   session's chart never lingers under the next sign-in. */
+function showLogin(message, kind) {
+  currentUser = null;
+  patients = [];
+  selectedId = null;
+
+  // Clear the patient list + per-patient panels.
+  const ul = $("#patient-list");
+  if (ul) ul.innerHTML = "";
+  const pc = $("#patient-count");
+  if (pc) pc.textContent = "";
+  resetNotePanels();
+  closeSuperbill();
+  const chart = $("#chart");
+  if (chart) chart.hidden = true;
+  const empty = $("#empty-state");
+  if (empty) empty.hidden = false;
+  hideBanner();
+
+  // Header: hide user chrome.
+  $("#user-name").hidden = true;
+  $("#user-name").textContent = "";
+  $("#btn-logout").hidden = true;
+  $("#btn-sample").hidden = true;
+
+  // Hide the app, show the login card; reset to the sign-in form.
+  $("#app-layout").hidden = true;
+  $("#login-screen").hidden = false;
+  showRegister(false);
+  const pw = $("#login-password");
+  if (pw) pw.value = "";
+  const rpw = $("#register-password");
+  if (rpw) rpw.value = "";
+  showLoginMsg(message, kind || "info");
+}
+
+/* Enter the app for an authenticated user. */
+function showApp(user) {
+  currentUser = user || null;
+  $("#login-screen").hidden = true;
+  $("#app-layout").hidden = false;
+
+  const un = $("#user-name");
+  un.textContent = (user && user.displayName) || (user && user.username) || "Signed in";
+  un.hidden = false;
+  $("#btn-logout").hidden = false;
+  $("#btn-sample").hidden = false;
+
+  showLoginMsg("", null);
+  loadPatients();
+}
+
+/* Called from apiGet/apiPost on a 401 — the session ended mid-use. */
+function handleSessionExpired() {
+  // Only bounce once; if we're already on the login screen, do nothing.
+  if ($("#login-screen") && !$("#login-screen").hidden) return;
+  showLogin("Your session ended, please sign in again.", "info");
+}
+
+function showRegister(on) {
+  const login = $("#login-form");
+  const reg = $("#register-form");
+  if (!login || !reg) return;
+  login.hidden = !!on;
+  reg.hidden = !on;
+}
+
+async function doLogin(e) {
+  if (e) e.preventDefault();
+  const username = ($("#login-username").value || "").trim();
+  const password = $("#login-password").value || "";
+  if (!username || !password) {
+    showLoginMsg("Please enter a username and password.", "err");
+    return;
+  }
+  const btn = $("#btn-login");
+  btn.disabled = true;
+  showLoginMsg("Signing in…", "info");
+  try {
+    const res = await authFetch("/auth/login", { username, password });
+    if (res.status === 401) {
+      $("#login-password").value = "";
+      showLoginMsg("Invalid username or password.", "err");
+      return;
+    }
+    if (!res.ok) {
+      showLoginMsg("Could not sign in (error " + res.status + "). Please try again.", "err");
+      return;
+    }
+    const user = await res.json().catch(() => null);
+    showApp(user);
+  } catch (err) {
+    showLoginMsg("Could not reach the server. Is it running?", "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doRegister(e) {
+  if (e) e.preventDefault();
+  const username = ($("#register-username").value || "").trim();
+  const password = $("#register-password").value || "";
+  const displayName = ($("#register-displayname").value || "").trim();
+  if (!username || !password || !displayName) {
+    showLoginMsg("Please fill in every field.", "err");
+    return;
+  }
+  const btn = $("#btn-register");
+  btn.disabled = true;
+  showLoginMsg("Creating account…", "info");
+  try {
+    const res = await authFetch("/auth/register", { username, password, displayName });
+    if (res.status === 403) {
+      // An account already exists — fall back to sign-in.
+      showRegister(false);
+      $("#login-username").value = username;
+      $("#login-password").value = "";
+      showLoginMsg("An account already exists — please sign in.", "err");
+      return;
+    }
+    if (!res.ok && res.status !== 201) {
+      showLoginMsg("Could not create the account (error " + res.status + ").", "err");
+      return;
+    }
+    const user = await res.json().catch(() => null);
+    showApp(user);
+  } catch (err) {
+    showLoginMsg("Could not reach the server. Is it running?", "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doLogout() {
+  const btn = $("#btn-logout");
+  btn.disabled = true;
+  try {
+    await authFetch("/auth/logout", {}).catch(() => null);
+  } finally {
+    btn.disabled = false;
+    showLogin("You've been signed out.", "info");
+  }
+}
+
+/* On load: probe the session and gate the app accordingly. */
+async function checkAuth() {
+  try {
+    const res = await authFetch("/auth/me");
+    if (res.ok) {
+      const user = await res.json().catch(() => null);
+      showApp(user);
+    } else {
+      // 401 (or anything non-OK) → show the login screen.
+      showLogin("", null);
+    }
+  } catch (err) {
+    showLogin("Could not reach the server. Is it running?", "err");
+  }
 }
 
 /* ---------- init ---------- */
@@ -809,7 +1019,15 @@ function init() {
   $("#btn-print-superbill").addEventListener("click", printSuperbill);
   $("#btn-close-superbill").addEventListener("click", closeSuperbill);
 
-  loadPatients();
+  // Auth
+  $("#login-form").addEventListener("submit", doLogin);
+  $("#register-form").addEventListener("submit", doRegister);
+  $("#link-show-register").addEventListener("click", () => { showLoginMsg("", null); showRegister(true); });
+  $("#link-show-login").addEventListener("click", () => { showLoginMsg("", null); showRegister(false); });
+  $("#btn-logout").addEventListener("click", doLogout);
+
+  // Gate the app on the session before loading any patient data.
+  checkAuth();
 }
 
 document.addEventListener("DOMContentLoaded", init);

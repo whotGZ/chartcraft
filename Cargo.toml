@@ -3,7 +3,7 @@ name = "chartcraft"
 version = "0.0.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Clinician-first, FHIR-native, open-source EMR in Rust (Milestone 2: FHIR search + static web serving on top of SQLite persistence, generic FHIR CRUD, Provenance + AuditEvent, /metadata)"
+description = "Clinician-first, FHIR-native, open-source EMR in Rust (Milestone 4: local password auth + sessions + access control + real Provenance/AuditEvent signer, on top of FHIR CRUD/search, versioned hash-chained store, superbill, and static web serving)"
 
 [dependencies]
 axum = "0.7"
@@ -13,3 +13,9 @@ uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tower-http = { version = "0.5", features = ["fs"] }
 sha2 = "0.10"
+argon2 = "0.6.0"
+rand = "0.10.4"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }

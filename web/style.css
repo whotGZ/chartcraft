@@ -109,6 +109,96 @@ body {
 }
 .btn-primary:hover { background: var(--accent-ink); border-color: var(--accent-ink); }
 
+/* ---------- Header user chrome ---------- */
+.user-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-soft);
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- Login / auth gate ---------- */
+.login-screen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+}
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 28px rgba(16, 24, 40, 0.08);
+  padding: 32px 30px 28px;
+}
+.login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 22px;
+}
+.login-wordmark {
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.login-title {
+  margin: 0 0 18px;
+  font-size: 16px;
+  font-weight: 700;
+  text-align: center;
+  color: var(--text);
+}
+.login-form { display: flex; flex-direction: column; gap: 14px; }
+.login-field { gap: 5px; }
+.login-field input {
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 9px 11px;
+  width: 100%;
+}
+.login-field input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.login-submit { width: 100%; margin-top: 4px; }
+.login-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 2px;
+  text-align: center;
+}
+.login-link:hover { color: var(--accent-ink); text-decoration: underline; }
+.login-msg {
+  font-size: 13px;
+  text-align: center;
+  padding: 9px 12px;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border: 1px solid #cfe4e5;
+}
+.login-msg.err {
+  background: #fdecec;
+  color: var(--danger);
+  border-color: #f6cccc;
+}
+
 /* ---------- Banner (errors / status) ---------- */
 .banner {
   padding: 11px 24px;
