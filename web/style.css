@@ -21,6 +21,11 @@
 
 * { box-sizing: border-box; }
 
+/* Make the hidden attribute authoritative. Several gate-critical elements carry
+   `hidden` alongside a class with an explicit display (.login-form/.login-screen/
+   .layout); without this, the class wins and they render even when gated off. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

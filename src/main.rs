@@ -367,16 +367,29 @@ async fn register(
         Ok(false) => {
             return auth_error(StatusCode::FORBIDDEN, "registration is closed");
         }
-        Err(e) => return auth_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        // MF-4: real error logged server-side, generic body to the client.
+        Err(e) => return auth_server_error(&e.to_string()),
     }
 
-    let principal = match auth.register(&creds) {
+    // MF-1: `register` does argon2 hashing (CPU-bound). Run it on the blocking
+    // pool so a flood of registers can't starve the tokio runtime. Validation
+    // (MF-3) lives inside `AuthState::register`, so it runs here too.
+    let auth2 = auth.clone();
+    let register_result = tokio::task::spawn_blocking(move || auth2.register(&creds))
+        .await
+        .expect("register task");
+    let principal = match register_result {
         Ok(p) => p,
         // UsernameTaken can only mean a concurrent bootstrap won the race.
         Err(auth::AuthError::UsernameTaken) => {
             return auth_error(StatusCode::FORBIDDEN, "registration is closed");
         }
-        Err(e) => return auth_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        // MF-3: validation failure → 400 with the (safe, policy-naming) message.
+        Err(auth::AuthError::InvalidInput(msg)) => {
+            return auth_error(StatusCode::BAD_REQUEST, msg);
+        }
+        // MF-4: DB/store error logged server-side, generic body to the client.
+        Err(e) => return auth_server_error(&e.to_string()),
     };
 
     let body = principal_json(&principal);
@@ -397,8 +410,30 @@ async fn login(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     let creds = Credentials::from_value(&body);
-    match auth.verify(&creds.username, &creds.password) {
+
+    // MF-1: refuse a locked-out username BEFORE any argon2 work — a login flood
+    // can't even reach the crypto path, let alone succeed. Generic message (no
+    // hint whether the lockout vs the credentials is the reason).
+    if auth.is_locked(&creds.username) {
+        return auth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts, try again later",
+        );
+    }
+
+    // MF-1: argon2 verify is CPU-bound — run it on the blocking pool so it can't
+    // starve the async runtime under a login flood.
+    let auth2 = auth.clone();
+    let username = creds.username.clone();
+    let password = creds.password.clone();
+    let verify_result = tokio::task::spawn_blocking(move || auth2.verify(&username, &password))
+        .await
+        .expect("login verify task");
+
+    match verify_result {
         Ok(Some(principal)) => {
+            // MF-1: a clean login clears the failure counter.
+            auth.record_success(&creds.username);
             let body = principal_json(&principal);
             let token = auth.create_session(principal);
             (
@@ -408,8 +443,13 @@ async fn login(
             )
                 .into_response()
         }
-        Ok(None) => auth_error(StatusCode::UNAUTHORIZED, "invalid username or password"),
-        Err(e) => auth_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(None) => {
+            // MF-1: a failed verify counts toward the lockout.
+            auth.record_failure(&creds.username);
+            auth_error(StatusCode::UNAUTHORIZED, "invalid username or password")
+        }
+        // MF-4: real error logged server-side, generic body to the client.
+        Err(e) => auth_server_error(&e.to_string()),
     }
 }
 
@@ -456,8 +496,11 @@ fn write(
     // first-write race — two first-PUTs to the same id could both read "no current
     // version" and both log "C". The HTTP STATUS below is now race-free (derived
     // from the version commit returns), but fully fixing the label needs the audit
-    // op to learn its version after commit, which means restructuring the write
-    // path — an M4 (auth) concern. Status is fixed now; label defers to M4.
+    // op to learn its committed version — the audit WriteOp rides in the SAME
+    // atomic batch, so its action is fixed BEFORE `commit` returns the versions,
+    // and deriving it from `versions[0]` would mean splitting the write path or a
+    // post-commit label patch. Deferred to a later concurrency-hardening pass;
+    // status is fixed now, the label is not.
     let is_create = match store.get(resource_type, id) {
         Ok(existing) => existing.is_none(),
         Err(e) => return server_error(&e.to_string()),
@@ -539,11 +582,25 @@ fn unsupported(resource_type: &str) -> (StatusCode, Json<Value>) {
     )
 }
 
+/// MF-4: a 500. The real error (DB/store text) is logged SERVER-SIDE only; the
+/// client body carries a FIXED generic message, never raw internal detail — so a
+/// rusqlite/StoreError string can't leak to an attacker. All call sites already
+/// pass `e.to_string()`, so this one change covers every `server_error(&e...)`
+/// site with no call-site churn.
 fn server_error(detail: &str) -> (StatusCode, Json<Value>) {
+    eprintln!("[chartcraft] internal error: {detail}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(operation_outcome("error", "exception", detail)),
+        Json(operation_outcome("error", "exception", "internal error")),
     )
+}
+
+/// MF-4: the auth-shaped parallel to `server_error` — log the real error, return
+/// a generic `{"error":"internal error"}` 500. Routes the auth handlers' `Err(e)`
+/// arms (which previously formatted the raw error into the body).
+fn auth_server_error(detail: &str) -> axum::response::Response {
+    eprintln!("[chartcraft] internal error: {detail}");
+    auth_error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
 
 fn app(state: AppState) -> Router {
@@ -592,6 +649,19 @@ async fn main() {
         store,
         auth: Arc::new(AuthState::new(Box::new(auth_store))),
     };
+
+    // MF-2: periodic sweep that reclaims expired sessions, so abandoned tokens are
+    // freed even if nothing ever looks them up again. Holds its own Arc clone.
+    {
+        let auth = state.auth.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(auth::SESSION_SWEEP_INTERVAL);
+            loop {
+                tick.tick().await;
+                auth.sweep_expired(std::time::Instant::now());
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
         .await
@@ -1314,7 +1384,8 @@ mod tests {
             "POST",
             "/auth/register",
             None,
-            Some(json!({"username": "admin", "password": "pw", "displayName": "Dr Admin"})),
+            // MF-3: bootstrap password must now meet the 12-char minimum.
+            Some(json!({"username": "admin", "password": "admin-pw-1234", "displayName": "Dr Admin"})),
         )
         .await;
         assert_eq!(code, StatusCode::CREATED);
@@ -1362,7 +1433,7 @@ mod tests {
             "POST",
             "/auth/register",
             None,
-            Some(json!({"username": "bob", "password": "hunter2", "displayName": "Bob"})),
+            Some(json!({"username": "bob", "password": "hunter2-long-pw", "displayName": "Bob"})),
         )
         .await;
 
@@ -1372,7 +1443,7 @@ mod tests {
             "POST",
             "/auth/login",
             None,
-            Some(json!({"username": "bob", "password": "hunter2"})),
+            Some(json!({"username": "bob", "password": "hunter2-long-pw"})),
         )
         .await;
         assert_eq!(code, StatusCode::OK);
@@ -1408,6 +1479,149 @@ mod tests {
         assert_eq!(body2["error"], body["error"], "identical message for both failures");
     }
 
+    /// MF-1: five wrong passwords lock the username out — the 6th attempt is 429
+    /// and never reaches a successful-looking path; a correct login resets it.
+    #[tokio::test]
+    async fn repeated_wrong_passwords_lock_out_then_429() {
+        let app = app(mem_app_state());
+        send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "dave", "password": "dave-strong-pw", "displayName": "Dave"})),
+        )
+        .await;
+
+        // Five wrong-password attempts: each a plain 401 (still below the cap).
+        for _ in 0..5 {
+            let (code, _, _) = send(
+                &app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(json!({"username": "dave", "password": "WRONG"})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED);
+        }
+
+        // The 6th attempt — even with the CORRECT password — is refused as 429,
+        // proving the lockout short-circuits before any successful path.
+        let (code, cookie, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "dave", "password": "dave-strong-pw"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+        assert!(cookie.is_none(), "a locked-out login mints no session cookie");
+    }
+
+    /// MF-1: a successful login (before the cap) resets the failure counter, so a
+    /// later streak of failures starts fresh rather than tripping early.
+    #[tokio::test]
+    async fn successful_login_resets_the_failure_counter() {
+        let app = app(mem_app_state());
+        send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "erin", "password": "erin-strong-pw", "displayName": "Erin"})),
+        )
+        .await;
+
+        // Four failures (below the cap of 5)...
+        for _ in 0..4 {
+            send(
+                &app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(json!({"username": "erin", "password": "WRONG"})),
+            )
+            .await;
+        }
+        // ...then a correct login succeeds (not yet locked) and resets the count.
+        let (code, cookie, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "erin", "password": "erin-strong-pw"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(cookie.is_some());
+
+        // Four MORE failures must again stay below the cap (counter was reset), so
+        // a correct login still goes through — not a 429.
+        for _ in 0..4 {
+            send(
+                &app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(json!({"username": "erin", "password": "WRONG"})),
+            )
+            .await;
+        }
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "erin", "password": "erin-strong-pw"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "counter reset by the earlier success");
+    }
+
+    /// MF-3: register rejects a blank username and a short password with 400, but a
+    /// valid bootstrap still 201s (exercised through the full router).
+    #[tokio::test]
+    async fn register_validation_rejects_bad_input_400() {
+        let app = app(mem_app_state());
+
+        // Blank username → 400.
+        let (code, _, body) = send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "   ", "password": "a-long-enough-pw", "displayName": "X"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+
+        // Short password (< 12) → 400 (table still empty, so it's a validation
+        // rejection, not "registration closed").
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "frank", "password": "short", "displayName": "Frank"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // A valid bootstrap still succeeds.
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "frank", "password": "frank-strong-pw", "displayName": "Frank"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+    }
+
     #[tokio::test]
     async fn me_reflects_the_session_and_logout_clears_it() {
         let app = app(mem_app_state());
@@ -1416,7 +1630,7 @@ mod tests {
             "POST",
             "/auth/register",
             None,
-            Some(json!({"username": "carol", "password": "pw", "displayName": "Carol"})),
+            Some(json!({"username": "carol", "password": "carol-pw-1234", "displayName": "Carol"})),
         )
         .await;
         let cookie = cookie_pair(&cookie.unwrap());

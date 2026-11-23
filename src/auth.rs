@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use argon2::password_hash::{
     phc::PasswordHash, PasswordHasher, PasswordVerifier,
@@ -78,6 +79,10 @@ pub enum AuthError {
     Db(String),
     /// Username already taken (register) — surfaces as a 409/403 upstream.
     UsernameTaken,
+    /// Register input failed server-side validation (blank username / weak
+    /// password) — surfaces as a 400 upstream. The message is safe to show the
+    /// client (it names the policy, never internal/DB detail).
+    InvalidInput(&'static str),
 }
 
 impl std::fmt::Display for AuthError {
@@ -85,6 +90,7 @@ impl std::fmt::Display for AuthError {
         match self {
             AuthError::Db(m) => write!(f, "auth store error: {m}"),
             AuthError::UsernameTaken => write!(f, "username already taken"),
+            AuthError::InvalidInput(m) => write!(f, "{m}"),
         }
     }
 }
@@ -140,6 +146,10 @@ pub struct SqliteAuthStore {
 impl SqliteAuthStore {
     pub fn open(path: &str) -> Result<Self, AuthError> {
         let conn = Connection::open(path)?;
+        // N5: the clinical store and the auth store share `chartcraft.db`. Wait up
+        // to 5 s for a concurrent writer's lock instead of surfacing SQLITE_BUSY as
+        // a 500 the moment the two connections contend.
+        conn.busy_timeout(Duration::from_millis(5000))?;
         Self::init(&conn)?;
         Ok(SqliteAuthStore {
             conn: Mutex::new(conn),
@@ -170,7 +180,9 @@ impl SqliteAuthStore {
 
 impl AuthStore for SqliteAuthStore {
     fn user_count(&self) -> Result<u64, AuthError> {
-        let conn = self.conn.lock().unwrap();
+        // N3: recover a poisoned lock rather than letting one panic permanently
+        // wedge auth — a stale guard is fine here (SQLite is still consistent).
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
         Ok(n as u64)
     }
@@ -182,7 +194,7 @@ impl AuthStore for SqliteAuthStore {
         display_name: &str,
         password_hash: &str,
     ) -> Result<(), AuthError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // Guarded insert: the row lands ONLY if the table is still empty. Both the
         // emptiness check and the insert happen in one statement under the
         // connection lock, so concurrent first-registers can't both succeed.
@@ -201,7 +213,7 @@ impl AuthStore for SqliteAuthStore {
 
     fn find_by_username(&self, username: &str) -> Result<Option<UserRecord>, AuthError> {
         use rusqlite::OptionalExtension;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let rec = conn
             .query_row(
                 "SELECT id, username, display_name, password_hash FROM users WHERE username = ?1",
@@ -230,7 +242,7 @@ pub struct InMemoryAuthStore {
 
 impl AuthStore for InMemoryAuthStore {
     fn user_count(&self) -> Result<u64, AuthError> {
-        Ok(self.users.lock().unwrap().len() as u64)
+        Ok(self.users.lock().unwrap_or_else(|e| e.into_inner()).len() as u64)
     }
 
     fn insert_first_user(
@@ -240,7 +252,7 @@ impl AuthStore for InMemoryAuthStore {
         display_name: &str,
         password_hash: &str,
     ) -> Result<(), AuthError> {
-        let mut users = self.users.lock().unwrap();
+        let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
         // Bootstrap guard under the same lock as the insert: refuse unless empty.
         if !users.is_empty() {
             return Err(AuthError::UsernameTaken);
@@ -258,7 +270,7 @@ impl AuthStore for InMemoryAuthStore {
     }
 
     fn find_by_username(&self, username: &str) -> Result<Option<UserRecord>, AuthError> {
-        let users = self.users.lock().unwrap();
+        let users = self.users.lock().unwrap_or_else(|e| e.into_inner());
         Ok(users.get(username).map(|u| UserRecord {
             id: u.id.clone(),
             username: u.username.clone(),
@@ -273,12 +285,52 @@ impl AuthStore for InMemoryAuthStore {
 /// Name of the session cookie.
 pub const SESSION_COOKIE: &str = "chartcraft_session";
 
+// --- login lockout (MF-1) ---------------------------------------------------
+
+/// Failed-login bookkeeping for one username. In-memory; reset on success.
+struct Attempts {
+    count: u32,
+    locked_until: Option<Instant>,
+}
+
+/// After this many failures within the window, the username is locked out.
+const MAX_FAILURES: u32 = 5;
+/// How long a lockout lasts.
+const LOCKOUT: Duration = Duration::from_secs(15 * 60);
+
+// --- session expiry (MF-2) --------------------------------------------------
+
+/// Absolute session lifetime: a session is dead this long after it was issued,
+/// no matter how active.
+const SESSION_ABSOLUTE: Duration = Duration::from_secs(12 * 60 * 60);
+/// Idle timeout: a session is dead this long after it was last used.
+const SESSION_IDLE: Duration = Duration::from_secs(30 * 60);
+/// How often the background sweep reclaims expired sessions.
+pub const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// A live server-side session: the Principal plus the timestamps that bound its
+/// lifetime (idle + absolute).
+struct Session {
+    principal: Principal,
+    issued_at: Instant,
+    last_seen: Instant,
+    // ponytail: stub for the upcoming TOTP work — records how far the session has
+    // cleared MFA (0 = password only). Unused until TOTP lands; kept minimal now so
+    // the session struct doesn't have to change shape again then.
+    auth_level: u8,
+}
+
 /// Everything auth needs at request time: the users table plus the server-side
 /// session map. Lives in `AppState` behind an `Arc`.
 pub struct AuthState {
     store: Box<dyn AuthStore>,
-    // ponytail: in-memory sessions (token -> Principal); lost on restart.
-    sessions: Mutex<HashMap<String, Principal>>,
+    // ponytail: in-memory sessions (token -> Session); lost on restart.
+    sessions: Mutex<HashMap<String, Session>>,
+    // ponytail: login lockout is username-keyed and in-memory. An attacker can
+    // thus deliberately lock out the real admin (DoS), and the state is lost on
+    // restart. Acceptable for a single-admin local deploy; revisit with IP-based
+    // limiting + exponential backoff for a multi-user deployment.
+    attempts: Mutex<HashMap<String, Attempts>>,
 }
 
 impl AuthState {
@@ -286,6 +338,7 @@ impl AuthState {
         AuthState {
             store,
             sessions: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -293,7 +346,19 @@ impl AuthState {
     /// The store insert is bootstrap-GUARDED (empty-table-only, atomically), so
     /// `Err(UsernameTaken)` here means a concurrent register already bootstrapped —
     /// the handler maps that to a 403 (registration closed).
+    ///
+    /// MF-3: input validation is enforced HERE, at the store-facing path, not in
+    /// the handler — a future caller can't bypass it. A blank username or a
+    /// password under the minimum length is rejected BEFORE any hashing.
     pub fn register(&self, creds: &Credentials) -> Result<Principal, AuthError> {
+        if creds.username.trim().is_empty() {
+            return Err(AuthError::InvalidInput("username must not be blank"));
+        }
+        if creds.password.chars().count() < MIN_PASSWORD_LEN {
+            return Err(AuthError::InvalidInput(
+                "password must be at least 12 characters",
+            ));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let hash = hash_password(&creds.password);
         self.store
@@ -308,6 +373,53 @@ impl AuthState {
     /// True when no user exists yet — register is allowed only then.
     pub fn no_users_yet(&self) -> Result<bool, AuthError> {
         Ok(self.store.user_count()? == 0)
+    }
+
+    /// MF-1: is this username currently locked out? Delegates to an `at` variant
+    /// so tests can drive the clock. A lockout whose deadline has passed reads as
+    /// unlocked (the counter is lazily cleared on the next failure/success).
+    pub fn is_locked(&self, username: &str) -> bool {
+        self.is_locked_at(username, Instant::now())
+    }
+
+    fn is_locked_at(&self, username: &str, now: Instant) -> bool {
+        let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        match attempts.get(username).and_then(|a| a.locked_until) {
+            Some(until) => now < until,
+            None => false,
+        }
+    }
+
+    /// MF-1: record a failed login. After `MAX_FAILURES`, arm the lockout.
+    pub fn record_failure(&self, username: &str) {
+        self.record_failure_at(username, Instant::now());
+    }
+
+    fn record_failure_at(&self, username: &str, now: Instant) {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = attempts.entry(username.to_string()).or_insert(Attempts {
+            count: 0,
+            locked_until: None,
+        });
+        // An expired lockout resets the window before counting this failure.
+        if let Some(until) = entry.locked_until {
+            if now >= until {
+                entry.count = 0;
+                entry.locked_until = None;
+            }
+        }
+        entry.count += 1;
+        if entry.count >= MAX_FAILURES {
+            entry.locked_until = Some(now + LOCKOUT);
+        }
+    }
+
+    /// MF-1: clear the failure counter on a successful login.
+    pub fn record_success(&self, username: &str) {
+        self.attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(username);
     }
 
     /// Verify a username/password. Returns the Principal on success, `None` on any
@@ -340,22 +452,74 @@ impl AuthState {
     /// Mint a fresh session for a Principal, returning the opaque cookie token.
     pub fn create_session(&self, principal: Principal) -> String {
         let token = new_session_token();
+        let now = Instant::now();
         self.sessions
             .lock()
-            .unwrap()
-            .insert(token.clone(), principal);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                token.clone(),
+                Session {
+                    principal,
+                    issued_at: now,
+                    last_seen: now,
+                    auth_level: 0,
+                },
+            );
         token
     }
 
-    /// Resolve a session token to its Principal, if the session exists.
+    /// Resolve a session token to its Principal, if the session exists AND is not
+    /// expired. Delegates to an `at` variant so tests can drive the clock.
     pub fn lookup_session(&self, token: &str) -> Option<Principal> {
-        self.sessions.lock().unwrap().get(token).cloned()
+        self.lookup_session_at(token, Instant::now())
+    }
+
+    /// MF-2: like `lookup_session`, but with an explicit "now". A session past its
+    /// absolute lifetime (`now - issued_at > ABSOLUTE`) or idle timeout
+    /// (`now - last_seen > IDLE`) is removed and treated as absent (→ 401).
+    /// Otherwise `last_seen` is refreshed and the Principal returned.
+    fn lookup_session_at(&self, token: &str, now: Instant) -> Option<Principal> {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        match sessions.get_mut(token) {
+            Some(s) if session_expired(s, now) => {
+                sessions.remove(token);
+                None
+            }
+            Some(s) => {
+                s.last_seen = now;
+                Some(s.principal.clone())
+            }
+            None => None,
+        }
+    }
+
+    /// MF-2: reclaim every expired session. Called on an interval by the
+    /// background sweep so abandoned tokens don't linger until a lookup clears
+    /// them. Takes an explicit `now` so it can be tested directly.
+    pub fn sweep_expired(&self, now: Instant) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, s| !session_expired(s, now));
     }
 
     /// Invalidate a session (logout). Idempotent.
     pub fn destroy_session(&self, token: &str) {
-        self.sessions.lock().unwrap().remove(token);
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(token);
     }
+}
+
+/// Minimum accepted password length (MF-3). Counts Unicode scalar values, not
+/// bytes, so a 12-char passphrase of multibyte characters still passes.
+const MIN_PASSWORD_LEN: usize = 12;
+
+/// True when a session has outlived its absolute lifetime OR its idle timeout.
+fn session_expired(s: &Session, now: Instant) -> bool {
+    now.duration_since(s.issued_at) > SESSION_ABSOLUTE
+        || now.duration_since(s.last_seen) > SESSION_IDLE
 }
 
 /// Hash a password into an argon2id PHC string, with a random salt (argon2's
@@ -422,14 +586,35 @@ fn cookie_value(header: &str, name: &str) -> Option<String> {
     })
 }
 
+/// N1: `Secure` is config-driven. When `CHARTCRAFT_SECURE_COOKIES` is set to a
+/// truthy value (`1`/`true`), the session cookie carries `; Secure` so it only
+/// rides TLS. Default OFF so `http://localhost` dev still works.
+fn secure_cookies_enabled() -> bool {
+    matches!(
+        std::env::var("CHARTCRAFT_SECURE_COOKIES").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
 /// Build the `Set-Cookie` value that plants a session token.
 ///
 /// Flags: `HttpOnly` (no JS access), `SameSite=Strict` (no cross-site send),
-/// `Path=/` (whole app). ponytail: `Secure` is deliberately OMITTED so the cookie
-/// works over http://localhost in dev. It MUST be added (`; Secure`) behind TLS in
-/// production — without it the session token can ride a plaintext request.
+/// `Path=/` (whole app), and `Secure` when `CHARTCRAFT_SECURE_COOKIES` is set
+/// (N1). Without `Secure` the token can ride a plaintext request, so production
+/// behind TLS MUST set the env var.
+///
+/// ponytail: the `__Host-` cookie name prefix is a future hardening — it pins the
+/// cookie to this exact host+path with no Domain and REQUIRES Secure, so it can't
+/// be adopted until Secure is always on (i.e. not in http-localhost dev).
 pub fn set_session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/")
+    set_session_cookie_with(token, secure_cookies_enabled())
+}
+
+/// Inner builder taking `secure` explicitly, so it's testable without mutating
+/// process env (which would race parallel tests).
+fn set_session_cookie_with(token: &str, secure: bool) -> String {
+    let secure_attr = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/{secure_attr}")
 }
 
 /// Build the `Set-Cookie` value that clears the session cookie (logout).
@@ -485,7 +670,7 @@ mod tests {
         let p = state
             .register(&Credentials {
                 username: "alice".into(),
-                password: "s3cr3t-pw".into(),
+                password: "s3cr3t-password".into(),
                 display_name: "Dr Alice".into(),
             })
             .unwrap();
@@ -539,5 +724,128 @@ mod tests {
         let raw = format!("other=x; {SESSION_COOKIE}=abc123; last=y");
         assert_eq!(cookie_value(&raw, SESSION_COOKIE).as_deref(), Some("abc123"));
         assert_eq!(cookie_value("nothing=here", SESSION_COOKIE), None);
+    }
+
+    // MF-1: lockout counter.
+    #[test]
+    fn lockout_arms_after_five_failures_and_success_resets() {
+        let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
+        let now = Instant::now();
+        assert!(!state.is_locked_at("admin", now), "not locked initially");
+
+        // Four failures stay BELOW the threshold, then a success clears the count.
+        for _ in 0..4 {
+            state.record_failure_at("admin", now);
+        }
+        assert!(!state.is_locked_at("admin", now), "4 failures < 5, not yet locked");
+        state.record_success("admin");
+
+        // Now five fresh failures DO arm the lockout.
+        for _ in 0..5 {
+            state.record_failure_at("admin", now);
+        }
+        assert!(state.is_locked_at("admin", now), "5 failures → locked");
+
+        // The lockout lifts once its window passes.
+        let later = now + LOCKOUT + Duration::from_secs(1);
+        assert!(!state.is_locked_at("admin", later), "lockout expires after the window");
+    }
+
+    // MF-2: a session forced past its lifetime is rejected (and removed).
+    #[test]
+    fn expired_session_is_rejected_by_lookup() {
+        let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
+        let p = Principal { id: "u1".into(), username: "u".into(), display_name: "U".into() };
+        let token = state.create_session(p);
+        let base = Instant::now();
+
+        // Idle timeout: last_seen too old → None, and the entry is purged.
+        assert!(
+            state.lookup_session_at(&token, base + SESSION_IDLE + Duration::from_secs(1)).is_none(),
+            "idle-expired session rejected"
+        );
+        assert!(
+            state.lookup_session_at(&token, base).is_none(),
+            "a rejected session is removed, not left behind"
+        );
+
+        // Absolute lifetime: a session kept NON-idle (refreshed inside the idle
+        // window the whole time) is still killed once it passes the absolute cap.
+        // We step forward in 20-min hops (< the 30-min idle limit), each refreshing
+        // last_seen, right up to just under 12 h — proving it stays live on idle —
+        // then check at 12 h + 1 s. That final check is within one idle window of
+        // the last refresh, so a None there can ONLY come from the absolute branch.
+        let token2 = state.create_session(Principal {
+            id: "u2".into(), username: "u2".into(), display_name: "U2".into(),
+        });
+        let t0 = Instant::now();
+        let step = Duration::from_secs(20 * 60);
+        let mut t = step;
+        while t < SESSION_ABSOLUTE {
+            assert!(
+                state.lookup_session_at(&token2, t0 + t).is_some(),
+                "session stays live while actively used inside the idle window"
+            );
+            t += step;
+        }
+        let past_absolute = t0 + SESSION_ABSOLUTE + Duration::from_secs(1);
+        assert!(
+            state.lookup_session_at(&token2, past_absolute).is_none(),
+            "absolute-expired session rejected even though never idle"
+        );
+    }
+
+    // MF-2: the sweep reclaims expired sessions.
+    #[test]
+    fn sweep_removes_expired_sessions() {
+        let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
+        let token = state.create_session(Principal {
+            id: "u".into(), username: "u".into(), display_name: "U".into(),
+        });
+        let now = Instant::now();
+        state.sweep_expired(now + SESSION_ABSOLUTE + Duration::from_secs(1));
+        assert!(
+            state.lookup_session_at(&token, now).is_none(),
+            "swept session no longer resolves"
+        );
+    }
+
+    // MF-3: register input validation (store-facing path).
+    #[test]
+    fn register_rejects_blank_username_and_short_password() {
+        let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
+        let blank = state.register(&Credentials {
+            username: "   ".into(),
+            password: "a-perfectly-long-password".into(),
+            display_name: "X".into(),
+        });
+        assert!(matches!(blank, Err(AuthError::InvalidInput(_))), "blank username rejected");
+
+        let short = state.register(&Credentials {
+            username: "admin".into(),
+            password: "short".into(), // < 12 chars
+            display_name: "X".into(),
+        });
+        assert!(matches!(short, Err(AuthError::InvalidInput(_))), "short password rejected");
+
+        // A valid bootstrap still succeeds.
+        let ok = state.register(&Credentials {
+            username: "admin".into(),
+            password: "twelve-chars-ok".into(),
+            display_name: "Admin".into(),
+        });
+        assert!(ok.is_ok(), "valid bootstrap registers");
+    }
+
+    // N1: Secure flag is config-driven, tested without touching process env.
+    #[test]
+    fn secure_cookie_flag_is_appended_when_enabled() {
+        let off = set_session_cookie_with("tok", false);
+        assert!(!off.contains("Secure"), "Secure omitted by default");
+        assert!(off.contains("HttpOnly") && off.contains("SameSite=Strict") && off.contains("Path=/"));
+
+        let on = set_session_cookie_with("tok", true);
+        assert!(on.contains("; Secure"), "Secure appended when enabled");
+        assert!(on.contains("HttpOnly") && on.contains("SameSite=Strict") && on.contains("Path=/"));
     }
 }

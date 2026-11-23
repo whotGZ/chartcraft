@@ -365,6 +365,10 @@ impl SqliteStore {
     /// `is_current`/`patient_ref` columns), not silently corrupt.
     pub fn open(path: &str) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
+        // N5: the clinical store and the auth store share `chartcraft.db`. Wait up
+        // to 5 s for a concurrent writer's lock instead of surfacing SQLITE_BUSY as
+        // a 500 the instant the two connections contend.
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         Self::init(&conn)?;
         Ok(SqliteStore {
             conn: Mutex::new(conn),

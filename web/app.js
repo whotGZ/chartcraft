@@ -484,6 +484,14 @@ function resetNotePanels() {
   lastSkeleton = "";
   const det = $("#note-detail");
   if (det) det.hidden = true;
+  // Clear the opened-note content so patient PHI doesn't linger in the hidden
+  // detail panel (devtools-recoverable after a patient switch or logout).
+  const dTitle = $("#note-detail-title");
+  if (dTitle) dTitle.textContent = "";
+  const dMeta = $("#note-detail-meta");
+  if (dMeta) dMeta.textContent = "";
+  const dBody = $("#note-detail-body");
+  if (dBody) dBody.textContent = "";
   const msg = $("#note-save-msg");
   if (msg) msg.textContent = "";
 }
@@ -680,6 +688,9 @@ async function loadSamplePatient() {
 function closeSuperbill() {
   const sb = $("#superbill");
   if (sb) sb.hidden = true;
+  // Wipe the rendered superbill (patient name/DOB/dx) from the DOM, not just hide it.
+  const sheet = $("#superbill-sheet");
+  if (sheet) sheet.innerHTML = "";
   document.body.classList.remove("printing-superbill");
 }
 
@@ -834,6 +845,16 @@ function showLogin(message, kind) {
   if (ul) ul.innerHTML = "";
   const pc = $("#patient-count");
   if (pc) pc.textContent = "";
+  // Wipe the chart's PHI from the DOM (not just hide it) so it isn't
+  // devtools-recoverable on a shared workstation after logout / session-expiry.
+  const ptName = $("#pt-name");
+  if (ptName) ptName.textContent = "";
+  const ptMeta = $("#pt-meta");
+  if (ptMeta) ptMeta.textContent = "";
+  ["#list-problems", "#list-meds", "#list-allergies", "#list-vitals", "#list-notes"]
+    .forEach((sel) => { const n = $(sel); if (n) n.innerHTML = ""; });
+  ["#count-problems", "#count-meds", "#count-allergies", "#count-vitals", "#count-notes"]
+    .forEach((sel) => { const n = $(sel); if (n) n.textContent = "0"; });
   resetNotePanels();
   closeSuperbill();
   const chart = $("#chart");
@@ -852,10 +873,11 @@ function showLogin(message, kind) {
   $("#app-layout").hidden = true;
   $("#login-screen").hidden = false;
   showRegister(false);
-  const pw = $("#login-password");
-  if (pw) pw.value = "";
-  const rpw = $("#register-password");
-  if (rpw) rpw.value = "";
+  // Clear identity + password fields so the prior clinician's username/display
+  // name doesn't linger on the login card for the next person at the workstation.
+  ["#login-username", "#register-username", "#register-displayname",
+   "#login-password", "#register-password"]
+    .forEach((sel) => { const f = $(sel); if (f) f.value = ""; });
   showLoginMsg(message, kind || "info");
 }
 
