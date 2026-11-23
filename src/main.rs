@@ -57,6 +57,11 @@ type SharedStore = Arc<dyn ChartStore>;
 pub struct AppState {
     pub store: SharedStore,
     pub auth: Arc<AuthState>,
+    /// Demo mode (CHARTCRAFT_DEMO truthy). When set, a password login of a user
+    /// who has NOT enrolled TOTP is granted a `Full` session instead of
+    /// `PendingMfa` — so the seeded demo user reaches the chart without an
+    /// authenticator. ZERO effect when unset: the default path keeps enforced MFA.
+    pub demo: bool,
 }
 
 impl FromRef<AppState> for SharedStore {
@@ -416,9 +421,10 @@ async fn register(
 /// return the user, 200. On failure return a GENERIC 401 (no hint whether the
 /// username or the password was wrong — no user enumeration).
 async fn login(
-    State(auth): State<Arc<AuthState>>,
+    State(app): State<AppState>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
+    let auth = app.auth.clone();
     let creds = Credentials::from_value(&body);
 
     // MF-1: refuse a locked-out username BEFORE any argon2 work — a login flood
@@ -464,6 +470,12 @@ async fn login(
                         "invalid username or password",
                     );
                 }
+                AuthLevel::Full
+            } else if app.demo {
+                // DEMO ONLY: a non-enrolled user is granted a Full session so the
+                // seeded demo account reaches the chart without an authenticator.
+                // This relaxation is STRICTLY gated on `app.demo` (CHARTCRAFT_DEMO);
+                // the default path below is unchanged.
                 AuthLevel::Full
             } else {
                 // Not enrolled: a correct password yields a PendingMfa session that
@@ -781,6 +793,170 @@ fn app(state: AppState) -> Router {
         .fallback_service(ServeDir::new("web"))
 }
 
+/// Interpret an env value as a boolean flag: `"1"` or `"true"` (any case) is on,
+/// everything else (including unset) is off. Pure, so it's unit-testable without
+/// touching the process environment.
+fn is_truthy(val: Option<String>) -> bool {
+    matches!(val.as_deref(), Some("1") | Some("true") | Some("TRUE") | Some("True"))
+}
+
+/// Resolve the bind address: `CHARTCRAFT_BIND` when set and non-empty, else the
+/// local-first default `127.0.0.1:8080`. Pure (takes the env value) so the default
+/// and the override are unit-testable. The container sets `0.0.0.0:8080`.
+fn resolve_bind(val: Option<String>) -> String {
+    match val {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => "127.0.0.1:8080".to_string(),
+    }
+}
+
+/// DEMO ONLY: seed a demo admin and a populated sample chart on first boot. Called
+/// from `main()` only when demo mode is on AND the users table is empty, so it is
+/// idempotent — re-running on a populated db is a no-op (the empty-users gate is
+/// the whole idempotency contract). The user goes in via the normal bootstrap
+/// `register`; every clinical resource goes in via the same `write()` path the HTTP
+/// handlers use, so each gets its Provenance + AuditEvent through the real `commit`.
+fn seed_demo(store: &SharedStore, auth: &AuthState) {
+    let principal = match auth.register(&Credentials {
+        username: "demo".to_string(),
+        password: "demodemo1234".to_string(),
+        display_name: "Demo Clinician".to_string(),
+        totp: String::new(),
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[chartcraft] demo seed: register failed: {e}");
+            return;
+        }
+    };
+
+    let pid = "demo-patient-1";
+    let pref = format!("Patient/{pid}");
+    let subject = json!({ "reference": pref });
+
+    // Fixed ids so tests and re-runs are deterministic. All reference the demo
+    // patient so the chart cards (which fetch `?patient=<id>`) populate.
+    let resources: Vec<(&str, &str, Value)> = vec![
+        (
+            "Patient",
+            pid,
+            json!({
+                "name": [{ "family": "Whitfield", "given": ["Eleanor", "M"] }],
+                "gender": "female",
+                "birthDate": "1958-04-12",
+            }),
+        ),
+        (
+            "Condition",
+            "demo-cond-htn",
+            json!({
+                "clinicalStatus": { "coding": [{ "code": "active" }] },
+                "code": { "text": "Essential hypertension" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "Condition",
+            "demo-cond-dm2",
+            json!({
+                "clinicalStatus": { "coding": [{ "code": "active" }] },
+                "code": { "text": "Type 2 diabetes mellitus" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "Condition",
+            "demo-cond-hld",
+            json!({
+                "clinicalStatus": { "coding": [{ "code": "active" }] },
+                "code": { "text": "Hyperlipidemia" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "MedicationRequest",
+            "demo-med-lisinopril",
+            json!({
+                "status": "active",
+                "intent": "order",
+                "medicationCodeableConcept": { "text": "Lisinopril 10 mg oral tablet" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "MedicationRequest",
+            "demo-med-metformin",
+            json!({
+                "status": "active",
+                "intent": "order",
+                "medicationCodeableConcept": { "text": "Metformin 500 mg oral tablet" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "MedicationRequest",
+            "demo-med-atorvastatin",
+            json!({
+                "status": "active",
+                "intent": "order",
+                "medicationCodeableConcept": { "text": "Atorvastatin 20 mg oral tablet" },
+                "subject": subject,
+            }),
+        ),
+        (
+            "AllergyIntolerance",
+            "demo-allergy-penicillin",
+            json!({
+                "clinicalStatus": { "coding": [{ "code": "active" }] },
+                "code": { "text": "Penicillin" },
+                "reaction": [{ "manifestation": [{ "text": "Hives" }] }],
+                "patient": subject,
+            }),
+        ),
+        (
+            "Observation",
+            "demo-obs-bp",
+            json!({
+                "status": "final",
+                "code": { "text": "Blood pressure" },
+                "valueString": "138/86 mmHg",
+                "effectiveDateTime": "2026-11-20",
+                "subject": subject,
+            }),
+        ),
+        (
+            "Observation",
+            "demo-obs-a1c",
+            json!({
+                "status": "final",
+                "code": { "text": "Hemoglobin A1c" },
+                "valueString": "7.4 %",
+                "effectiveDateTime": "2026-11-20",
+                "subject": subject,
+            }),
+        ),
+        (
+            "DocumentReference",
+            "demo-doc-progress-note",
+            json!({
+                "status": "current",
+                "type": { "text": "Progress note" },
+                "description": "Routine follow-up: HTN, T2DM and hyperlipidemia stable on current regimen. Continue meds; recheck A1c in 3 months.",
+                "subject": subject,
+            }),
+        ),
+    ];
+
+    for (rtype, id, mut body) in resources {
+        body["resourceType"] = json!(rtype);
+        body["id"] = json!(id);
+        let (code, _) = write(store, rtype, id, &body, &principal);
+        if code != StatusCode::CREATED {
+            eprintln!("[chartcraft] demo seed: {rtype}/{id} unexpected status {code}");
+        }
+    }
+}
+
 /// M5 break-glass: `chartcraft --reset-mfa <username>` clears a user's TOTP state
 /// (live secret, pending secret, `totp_enabled`) so they re-enroll on next login —
 /// the recovery path for a lost authenticator. Handled BEFORE the server starts;
@@ -823,14 +999,36 @@ async fn main() {
     // process, so control only returns here when the flag was absent.
     maybe_reset_mfa();
 
+    let demo = is_truthy(std::env::var("CHARTCRAFT_DEMO").ok());
+
     let store: SharedStore =
         Arc::new(SqliteStore::open("chartcraft.db").expect("open chartcraft.db"));
     // Auth store shares the db FILE but owns its own connection — the clinical
     // store and the auth store stay cleanly separated.
     let auth_store = SqliteAuthStore::open("chartcraft.db").expect("open auth store");
+    let auth = Arc::new(AuthState::new(Box::new(auth_store)));
+
+    // DEMO ONLY: on first boot (no users yet) seed the demo admin + sample chart.
+    // The empty-users gate makes this idempotent across restarts of the same volume.
+    if demo {
+        match auth.no_users_yet() {
+            Ok(true) => seed_demo(&store, &auth),
+            Ok(false) => {}
+            Err(e) => eprintln!("[chartcraft] demo seed: could not check users: {e}"),
+        }
+        println!(
+            "============================================================\n\
+             DEMO MODE: authentication is relaxed and all data is fake.\n\
+             NEVER use with real patients or in production.\n\
+             Demo login:  demo / demodemo1234\n\
+             ============================================================"
+        );
+    }
+
     let state = AppState {
         store,
-        auth: Arc::new(AuthState::new(Box::new(auth_store))),
+        auth,
+        demo,
     };
 
     // MF-2: periodic sweep that reclaims expired sessions, so abandoned tokens are
@@ -846,11 +1044,12 @@ async fn main() {
         });
     }
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+    let bind = resolve_bind(std::env::var("CHARTCRAFT_BIND").ok());
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .expect("bind 127.0.0.1:8080");
+        .unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     println!(
-        "ChartCraft M4 on http://127.0.0.1:8080 \
+        "ChartCraft listening on http://{bind} \
          (auth at /auth/*, POST/GET /:resource_type, GET/PUT /:resource_type/:id, \
          GET /Patient/:id/$superbill, GET /metadata, static web/ at /)"
     );
@@ -881,6 +1080,20 @@ mod tests {
         AppState {
             store: mem_store(),
             auth: Arc::new(AuthState::new(Box::new(InMemoryAuthStore::default()))),
+            demo: false,
+        }
+    }
+
+    /// Like `mem_app_state`, but with demo mode ON (relaxed MFA + seeded chart via
+    /// `seed_demo`). Used by the demo-mode tests.
+    fn demo_app_state() -> AppState {
+        let store = mem_store();
+        let auth = Arc::new(AuthState::new(Box::new(InMemoryAuthStore::default())));
+        seed_demo(&store, &auth);
+        AppState {
+            store,
+            auth,
+            demo: true,
         }
     }
 
@@ -2350,5 +2563,134 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Deploy: bind address + demo mode ----------------------------------
+
+    /// `resolve_bind` defaults to the local-first address when unset/blank and
+    /// honors an explicit override.
+    #[test]
+    fn resolve_bind_default_and_override() {
+        assert_eq!(resolve_bind(None), "127.0.0.1:8080");
+        assert_eq!(resolve_bind(Some("".into())), "127.0.0.1:8080");
+        assert_eq!(resolve_bind(Some("   ".into())), "127.0.0.1:8080");
+        assert_eq!(resolve_bind(Some("0.0.0.0:8080".into())), "0.0.0.0:8080");
+        assert_eq!(resolve_bind(Some("127.0.0.1:9000".into())), "127.0.0.1:9000");
+    }
+
+    /// `is_truthy` accepts only "1"/"true" (any case); everything else is off.
+    #[test]
+    fn is_truthy_only_1_and_true() {
+        assert!(is_truthy(Some("1".into())));
+        assert!(is_truthy(Some("true".into())));
+        assert!(is_truthy(Some("TRUE".into())));
+        assert!(!is_truthy(Some("0".into())));
+        assert!(!is_truthy(Some("yes".into())));
+        assert!(!is_truthy(Some("".into())));
+        assert!(!is_truthy(None));
+    }
+
+    /// Demo seed, run on an empty store, creates the demo user and the sample
+    /// patient; running it a second time (users no longer empty → caller gates on
+    /// that) must not duplicate the patient.
+    #[tokio::test]
+    async fn demo_seed_populates_and_is_idempotent() {
+        let store = mem_store();
+        let auth = Arc::new(AuthState::new(Box::new(InMemoryAuthStore::default())));
+
+        seed_demo(&store, &auth);
+        // The demo user exists (registration is now closed).
+        assert_eq!(auth.no_users_yet().unwrap(), false);
+        // The sample patient and a couple of its clinical resources landed.
+        assert!(store.get("Patient", "demo-patient-1").unwrap().is_some());
+        assert!(store.get("Condition", "demo-cond-dm2").unwrap().is_some());
+        assert!(store.get("MedicationRequest", "demo-med-metformin").unwrap().is_some());
+        let patients = store.list("Patient").unwrap();
+        assert_eq!(patients.len(), 1, "exactly one demo patient");
+
+        // The idempotency contract is the empty-users gate in `main()`. Re-running
+        // seed_demo here would fail register (users not empty) and add nothing — so
+        // the patient count stays at one.
+        seed_demo(&store, &auth);
+        assert_eq!(store.list("Patient").unwrap().len(), 1, "no duplicate patient");
+    }
+
+    /// DEMO MODE: a password login of the seeded, non-enrolled demo user yields a
+    /// FULL session that can immediately read the seeded chart over FHIR.
+    #[tokio::test]
+    async fn demo_login_is_full_and_reaches_the_chart() {
+        let app = app(demo_app_state());
+
+        let (code, cookie, body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "demo", "password": "demodemo1234"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        // Relaxed: not enrolled, yet granted Full.
+        assert_eq!(body["mfaEnrolled"], json!(false));
+        assert_eq!(body["authLevel"], json!("full"));
+        let cookie = cookie_pair(&cookie.expect("login sets a session cookie"));
+
+        // The Full session reads PHI: the seeded patient is present.
+        let (code, _, body) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["resourceType"], "Bundle");
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["entry"][0]["resource"]["id"], json!("demo-patient-1"));
+
+        // The chart cards fetch `?patient=<id>` — the seeded conditions/meds show.
+        let (code, _, conds) =
+            send(&app, "GET", "/Condition?patient=demo-patient-1", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(conds["total"], json!(3), "three seeded conditions");
+        let (_, _, meds) = send(
+            &app,
+            "GET",
+            "/MedicationRequest?patient=demo-patient-1",
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(meds["total"], json!(3), "three seeded medications");
+    }
+
+    /// NON-DEMO MODE: the relaxation is strictly gated. A fresh (non-enrolled) user
+    /// logs in to a PendingMfa session and is 403 on a FHIR endpoint — proving the
+    /// demo relaxation does NOT leak into the default path.
+    #[tokio::test]
+    async fn non_demo_login_stays_pending_and_is_403_on_fhir() {
+        // demo: false (the default), built explicitly so this proves the gate.
+        let app = app(mem_app_state());
+
+        // Bootstrap a user (register → PendingMfa), then log in fresh.
+        send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "doc", "password": "a-long-enough-pw", "displayName": "Doc"})),
+        )
+        .await;
+
+        let (code, cookie, body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "doc", "password": "a-long-enough-pw"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["authLevel"], json!("pending"), "no demo → still PendingMfa");
+        let cookie = cookie_pair(&cookie.expect("login sets a session cookie"));
+
+        // PendingMfa → 403 on PHI (the MFA gate is intact).
+        let (code, _, oo) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(oo["resourceType"], "OperationOutcome");
     }
 }

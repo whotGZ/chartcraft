@@ -1,0 +1,16 @@
+# Keep the build context small: nothing here is needed to compile or run.
+target/
+*.db
+*.db-*
+.git/
+.gitignore
+.DS_Store
+**/.DS_Store
+
+# Docs and scratch — not part of the build.
+docs/
+*.md
+LICENSE
+Dockerfile
+docker-compose.yml
+.dockerignore

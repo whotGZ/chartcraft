@@ -1,0 +1,36 @@
+# ChartCraft — one-command demo.
+#
+#   docker compose up
+#
+# Then open http://localhost:8080 and sign in with  demo / demodemo1234.
+#
+# This default config runs in DEMO MODE: it seeds a fake sample chart and relaxes
+# authentication so you can look around without enrolling a two-factor app.
+# NEVER use demo mode with real patients or in production.
+
+services:
+  chartcraft:
+    build: .
+    # Host-local only: 127.0.0.1 so the EMR is reachable from THIS machine's
+    # browser and not exposed to the rest of the network. (Drop the "127.0.0.1:"
+    # prefix only if you deliberately want LAN access — and only behind TLS.)
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # Demo mode: seed sample data + relax MFA. Set to 0 (or remove this line)
+      # to run for real — the first registered user must then enroll TOTP
+      # two-factor before reaching any PHI.
+      CHARTCRAFT_DEMO: "1"
+      # Bind on all interfaces INSIDE the container (compose maps it to the host
+      # loopback above). Leave as-is.
+      CHARTCRAFT_BIND: "0.0.0.0:8080"
+      # PRODUCTION: serve behind TLS and set this to 1 so the session cookie is
+      # only sent over HTTPS.
+      # CHARTCRAFT_SECURE_COOKIES: "1"
+    volumes:
+      # Persists chartcraft.db across restarts. `docker compose down -v` wipes it
+      # (and re-seeds the demo on the next `up`).
+      - chartcraft-data:/data
+
+volumes:
+  chartcraft-data:

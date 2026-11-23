@@ -6,6 +6,33 @@ Status: pre-alpha. A working FHIR core, a clinician UI, an append-only hash-chai
 
 ---
 
+## Quick start (Docker)
+
+```sh
+docker compose up
+```
+
+Then open **http://localhost:8080** and sign in with:
+
+- **Username:** `demo`
+- **Password:** `demodemo1234`
+
+You land on a populated sample chart (Eleanor M Whitfield — hypertension, type 2 diabetes, hyperlipidemia, meds, a penicillin allergy, vitals, and a progress note). First boot takes a minute or two to compile; after that it is seconds.
+
+> **Demo mode is for trying it out, not for care.** `docker compose up` runs with `CHARTCRAFT_DEMO=1`, which **seeds fake data** and **relaxes authentication** (the demo user reaches the chart without enrolling an authenticator app). The banner in the logs says so. **Never point demo mode at real patients or run it in production.**
+
+### Running for real
+
+Turn the demo off and let the real auth flow take over:
+
+- Set `CHARTCRAFT_DEMO=0` in `docker-compose.yml` (or unset it). With demo off, the first account you register must **enroll TOTP two-factor** before it can read any PHI — the enforced-MFA flow.
+- Serve it behind **TLS** and set `CHARTCRAFT_SECURE_COOKIES=1` so the session cookie is only sent over HTTPS.
+- Remember the standing caveat above: **encryption at rest is not implemented yet**, so even with real auth, keep real patient data out until it lands.
+
+(No Docker? `cargo run` builds and runs the bare binary on `127.0.0.1:8080` with demo off — register the first user and enroll TOTP.)
+
+---
+
 ## Why
 
 Every working physician has the same complaint: the EMR is the worst software they touch, and they touch it all day. It is slow. It buries the one number you need under forty you don't. It was built as a billing engine wearing a clinical mask, so it optimizes for the biller and punishes the clinician. And it costs a hospital tens of millions of dollars and a startup its entire runway, so there is almost no competition.
