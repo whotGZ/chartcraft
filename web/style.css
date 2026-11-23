@@ -204,6 +204,58 @@ body {
   border-color: #f6cccc;
 }
 
+/* ---------- MFA enrollment ---------- */
+.mfa-instructions {
+  margin: 0 0 18px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  text-align: center;
+  color: var(--text-soft);
+}
+.mfa-qr-wrap {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 18px;
+}
+.mfa-qr {
+  width: 180px;
+  height: 180px;
+  display: block;
+  background: #fff;
+  padding: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+}
+.mfa-qr:not([src]) { visibility: hidden; }
+.mfa-secret-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 20px;
+}
+.mfa-secret-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.mfa-secret {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 7px 16px;
+  user-select: all;
+  word-break: break-all;
+  text-align: center;
+}
+#mfa-code { letter-spacing: 0.3em; text-align: center; }
+
 /* ---------- Banner (errors / status) ---------- */
 .banner {
   padding: 11px 24px;

@@ -34,6 +34,7 @@ async function apiGet(path) {
     headers: { Accept: "application/json" },
   });
   if (res.status === 401) { handleSessionExpired(); throw authError(path); }
+  if (res.status === 403) { handlePendingSession(); throw authError(path); }
   if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
   return res.json();
 }
@@ -46,6 +47,7 @@ async function apiPost(type, resource) {
     body: JSON.stringify(resource),
   });
   if (res.status === 401) { handleSessionExpired(); throw authError("/" + type); }
+  if (res.status === 403) { handlePendingSession(); throw authError("/" + type); }
   if (!res.ok) throw new Error(`POST /${type} → ${res.status}`);
   return res.json();
 }
@@ -833,9 +835,10 @@ function showLoginMsg(msg, kind) {
   m.hidden = !msg;
 }
 
-/* Swap to the login screen and tear down any in-memory patient state so one
-   session's chart never lingers under the next sign-in. */
-function showLogin(message, kind) {
+/* Tear down all in-memory + on-screen PHI so one session's chart never lingers
+   under the next state. Shared by the login bounce AND the enrollment bounce
+   (a 403 routes a pending session here from a loaded chart). */
+function clearPatientState() {
   currentUser = null;
   patients = [];
   selectedId = null;
@@ -869,22 +872,149 @@ function showLogin(message, kind) {
   $("#btn-logout").hidden = true;
   $("#btn-sample").hidden = true;
 
-  // Hide the app, show the login card; reset to the sign-in form.
   $("#app-layout").hidden = true;
+}
+
+/* Swap to the login screen and tear down any in-memory patient state so one
+   session's chart never lingers under the next sign-in. */
+function showLogin(message, kind) {
+  clearPatientState();
+  hideMfaScreen();
+
+  // Show the login card; reset to the sign-in form.
   $("#login-screen").hidden = false;
   showRegister(false);
-  // Clear identity + password fields so the prior clinician's username/display
-  // name doesn't linger on the login card for the next person at the workstation.
+  // Clear identity + password + code fields so the prior clinician's
+  // username/display name doesn't linger on the login card for the next person.
   ["#login-username", "#register-username", "#register-displayname",
-   "#login-password", "#register-password"]
+   "#login-password", "#register-password", "#login-totp"]
     .forEach((sel) => { const f = $(sel); if (f) f.value = ""; });
   showLoginMsg(message, kind || "info");
+}
+
+/* ---------- MFA enrollment screen ---------- */
+/* A session that is authenticated-but-pending (password done, TOTP not yet
+   enrolled) can only reach the enroll/confirm endpoints — not the chart. */
+let mfaEnrolling = false; // in-flight guard so parallel 403s don't re-POST enroll
+
+function showMfaMsg(msg, kind) {
+  const m = $("#mfa-msg");
+  if (!m) return;
+  m.textContent = msg || "";
+  m.className = "login-msg" + (kind ? " " + kind : "");
+  m.hidden = !msg;
+}
+
+/* Blank the QR + secret so this credential doesn't linger in the DOM once we
+   leave the screen (same rationale as the PHI wipes). */
+function hideMfaScreen() {
+  const qr = $("#mfa-qr");
+  if (qr) qr.removeAttribute("src");
+  const secret = $("#mfa-secret");
+  if (secret) secret.textContent = "";
+  const code = $("#mfa-code");
+  if (code) code.value = "";
+  showMfaMsg("", null);
+  const scr = $("#mfa-screen");
+  if (scr) scr.hidden = true;
+}
+
+/* Route a pending session to the enrollment screen and fetch its QR/secret.
+   Wipes any loaded chart first (the 403 path arrives from a live chart). */
+async function showEnroll(user) {
+  // Already on the enroll screen with a QR in flight/shown → don't re-enter
+  // (selectPatient fires six parallel fetches; six 403s must not mean six
+  // enroll POSTs, each rotating the secret and invalidating the shown QR).
+  const scr = $("#mfa-screen");
+  if (scr && !scr.hidden) return;
+
+  const pendingUser = user || currentUser || null;
+  clearPatientState();           // wipe PHI + hide the app
+  $("#login-screen").hidden = true;
+  currentUser = pendingUser;     // keep identity for the confirm → showApp merge
+
+  if (scr) scr.hidden = false;
+  const qr = $("#mfa-qr");
+  if (qr) qr.removeAttribute("src");
+  const secret = $("#mfa-secret");
+  if (secret) secret.textContent = "";
+  $("#mfa-code").value = "";
+
+  if (mfaEnrolling) return;
+  mfaEnrolling = true;
+  showMfaMsg("Preparing your setup code…", "info");
+  try {
+    const res = await authFetch("/auth/totp/enroll", {});
+    if (res.status === 401) { showLogin("Your session ended, please sign in again.", "info"); return; }
+    if (!res.ok) {
+      showMfaMsg("Could not start setup (error " + res.status + "). Reload and try again.", "err");
+      return;
+    }
+    const data = await res.json().catch(() => null);
+    if (!data) { showMfaMsg("Could not read the setup code. Reload and try again.", "err"); return; }
+    if (qr && data.qrPngBase64) qr.src = "data:image/png;base64," + data.qrPngBase64;
+    if (secret) secret.textContent = data.secret || "";
+    showMfaMsg("", null);
+    $("#mfa-code").focus();
+  } catch (err) {
+    showMfaMsg("Could not reach the server. Is it running?", "err");
+  } finally {
+    mfaEnrolling = false;
+  }
+}
+
+/* Called from apiGet/apiPost on a 403 — a pending session hit a PHI route.
+   Shouldn't happen if the gate is right, but route to enrollment defensively. */
+function handlePendingSession() {
+  const scr = $("#mfa-screen");
+  if (scr && !scr.hidden) return; // already enrolling
+  showEnroll(currentUser);
+}
+
+async function confirmMfa(e) {
+  if (e) e.preventDefault();
+  const code = ($("#mfa-code").value || "").replace(/\s+/g, "");
+  if (!code) { showMfaMsg("Enter the 6-digit code from your authenticator app.", "err"); return; }
+  const btn = $("#btn-mfa-confirm");
+  btn.disabled = true;
+  showMfaMsg("Verifying…", "info");
+  try {
+    const res = await authFetch("/auth/totp/confirm", { code });
+    if (res.status === 400) {
+      $("#mfa-code").value = "";
+      showMfaMsg("That code didn't match, try the current one.", "err");
+      return;
+    }
+    if (res.status === 401) { showLogin("Your session ended, please sign in again.", "info"); return; }
+    if (!res.ok) { showMfaMsg("Could not verify (error " + res.status + "). Try again.", "err"); return; }
+    // 200 → fully authenticated. Merge rather than re-hit /auth/me.
+    const confirmed = await res.json().catch(() => null);
+    const user = Object.assign({}, currentUser, confirmed,
+      { mfaEnrolled: true, authLevel: "full" });
+    hideMfaScreen();
+    showApp(user);
+  } catch (err) {
+    showMfaMsg("Could not reach the server. Is it running?", "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Route to the right screen for a freshly-authenticated user: a pending session
+   (or one without MFA enrolled) must enroll before reaching the chart. */
+function routeUser(user) {
+  if (user && user.authLevel === "full" && user.mfaEnrolled !== false) {
+    showApp(user);
+  } else {
+    showEnroll(user);
+  }
 }
 
 /* Enter the app for an authenticated user. */
 function showApp(user) {
   currentUser = user || null;
   $("#login-screen").hidden = true;
+  $("#mfa-screen").hidden = true;
   $("#app-layout").hidden = false;
 
   const un = $("#user-name");
@@ -916,6 +1046,7 @@ async function doLogin(e) {
   if (e) e.preventDefault();
   const username = ($("#login-username").value || "").trim();
   const password = $("#login-password").value || "";
+  const totp = ($("#login-totp").value || "").replace(/\s+/g, "");
   if (!username || !password) {
     showLoginMsg("Please enter a username and password.", "err");
     return;
@@ -924,10 +1055,13 @@ async function doLogin(e) {
   btn.disabled = true;
   showLoginMsg("Signing in…", "info");
   try {
-    const res = await authFetch("/auth/login", { username, password });
+    const res = await authFetch("/auth/login", { username, password, totp });
     if (res.status === 401) {
+      // The client can't tell whether this account requires a code, so keep the
+      // message generic — don't reveal which factor failed.
       $("#login-password").value = "";
-      showLoginMsg("Invalid username or password.", "err");
+      $("#login-totp").value = "";
+      showLoginMsg("Invalid credentials or code.", "err");
       return;
     }
     if (!res.ok) {
@@ -935,7 +1069,7 @@ async function doLogin(e) {
       return;
     }
     const user = await res.json().catch(() => null);
-    showApp(user);
+    routeUser(user);
   } catch (err) {
     showLoginMsg("Could not reach the server. Is it running?", "err");
   } finally {
@@ -970,7 +1104,8 @@ async function doRegister(e) {
       return;
     }
     const user = await res.json().catch(() => null);
-    showApp(user);
+    // A fresh account is authLevel:"pending" — routeUser sends it to enrollment.
+    routeUser(user);
   } catch (err) {
     showLoginMsg("Could not reach the server. Is it running?", "err");
   } finally {
@@ -995,7 +1130,7 @@ async function checkAuth() {
     const res = await authFetch("/auth/me");
     if (res.ok) {
       const user = await res.json().catch(() => null);
-      showApp(user);
+      routeUser(user);
     } else {
       // 401 (or anything non-OK) → show the login screen.
       showLogin("", null);
@@ -1047,6 +1182,10 @@ function init() {
   $("#link-show-register").addEventListener("click", () => { showLoginMsg("", null); showRegister(true); });
   $("#link-show-login").addEventListener("click", () => { showLoginMsg("", null); showRegister(false); });
   $("#btn-logout").addEventListener("click", doLogout);
+
+  // MFA enrollment
+  $("#mfa-form").addEventListener("submit", confirmMfa);
+  $("#btn-mfa-logout").addEventListener("click", doLogout);
 
   // Gate the app on the session before loading any patient data.
   checkAuth();

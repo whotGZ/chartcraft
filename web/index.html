@@ -58,6 +58,12 @@
           <span class="field-label">Password</span>
           <input id="login-password" type="password" autocomplete="current-password" required />
         </label>
+        <label class="field login-field">
+          <span class="field-label">Authenticator code</span>
+          <input id="login-totp" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                 autocomplete="one-time-code" autocapitalize="none" spellcheck="false"
+                 placeholder="6-digit code (if enabled)" />
+        </label>
         <button id="btn-login" class="btn btn-primary login-submit" type="submit">Sign in</button>
         <button id="link-show-register" class="login-link" type="button">First time? Create the admin account</button>
       </form>
@@ -79,6 +85,50 @@
         </label>
         <button id="btn-register" class="btn btn-primary login-submit" type="submit">Create account</button>
         <button id="link-show-login" class="login-link" type="button">Already have an account? Sign in</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- MFA enrollment gate (logged-in but authLevel === "pending") -->
+  <section id="mfa-screen" class="login-screen" hidden aria-label="Set up two-factor authentication">
+    <div class="login-card">
+      <div class="login-brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 3h6a2 2 0 0 1 2 2v0a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2v0a2 2 0 0 1 2-2z" />
+            <path d="M7 5H5a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" />
+            <path d="M12 11v6M9 14h6" />
+          </svg>
+        </span>
+        <span class="login-wordmark">ChartCraft</span>
+      </div>
+
+      <h1 class="login-title">Set up two-factor</h1>
+
+      <div id="mfa-msg" class="login-msg" hidden></div>
+
+      <p class="mfa-instructions">
+        Scan this with Google Authenticator, Authy, 1Password, or any authenticator
+        app, then enter the 6-digit code to finish setup.
+      </p>
+
+      <div class="mfa-qr-wrap">
+        <img id="mfa-qr" class="mfa-qr" alt="Two-factor QR code" />
+      </div>
+
+      <div class="mfa-secret-row">
+        <span class="mfa-secret-label">Can't scan? Enter this key manually</span>
+        <span id="mfa-secret" class="mfa-secret"></span>
+      </div>
+
+      <form id="mfa-form" class="login-form">
+        <label class="field login-field">
+          <span class="field-label">6-digit code</span>
+          <input id="mfa-code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                 autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required />
+        </label>
+        <button id="btn-mfa-confirm" class="btn btn-primary login-submit" type="submit">Verify &amp; finish</button>
+        <button id="btn-mfa-logout" class="login-link" type="button">Log out</button>
       </form>
     </div>
   </section>

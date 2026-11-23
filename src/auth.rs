@@ -37,6 +37,7 @@ use axum::{
 use rand::Rng;
 use rusqlite::Connection;
 use serde_json::Value;
+use totp_rs::{Builder as TotpBuilder, Secret, Totp, TotpError};
 
 use crate::fhir::{now_iso8601, operation_outcome};
 
@@ -49,15 +50,37 @@ pub struct Principal {
     pub display_name: String,
 }
 
+/// How far a session has cleared authentication. A `PendingMfa` session has a
+/// valid password but has NOT satisfied TOTP (either freshly registered, or
+/// enrolled-but-not-yet-confirmed); it may reach ONLY the `/auth/totp/*`
+/// endpoints. A `Full` session has cleared both factors and may reach PHI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthLevel {
+    PendingMfa,
+    Full,
+}
+
+impl AuthLevel {
+    /// The wire string the frontend codes against (`authLevel` field).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthLevel::PendingMfa => "pending",
+            AuthLevel::Full => "full",
+        }
+    }
+}
+
 /// Registration/login request body. No `Debug` derive and no logging of these —
-/// the plaintext `password` must never reach a log line or error format. Built by
-/// hand from a `serde_json::Value` (no `serde` derive dep, matching the rest of
-/// the codebase, which also works off `Value`).
+/// the plaintext `password` (and `totp` code) must never reach a log line or
+/// error format. Built by hand from a `serde_json::Value` (no `serde` derive dep,
+/// matching the rest of the codebase, which also works off `Value`).
 pub struct Credentials {
     pub username: String,
     pub password: String,
     /// Only present on register; login ignores it.
     pub display_name: String,
+    /// Only present on login when the user has TOTP enabled. Empty when omitted.
+    pub totp: String,
 }
 
 impl Credentials {
@@ -70,6 +93,7 @@ impl Credentials {
             username: s("username"),
             password: s("password"),
             display_name: s("displayName"),
+            totp: s("totp"),
         }
     }
 }
@@ -101,12 +125,16 @@ impl From<rusqlite::Error> for AuthError {
     }
 }
 
-/// A persisted user row, including the argon2 PHC hash (used only for verify).
+/// A persisted user row, including the argon2 PHC hash (used only for verify) and
+/// the TOTP enrollment state. `totp_secret` is the base32 shared secret, set at
+/// enroll (NULL until then); `totp_enabled` flips true at confirm.
 pub struct UserRecord {
     id: String,
     username: String,
     display_name: String,
     password_hash: String,
+    totp_secret: Option<String>,
+    totp_enabled: bool,
 }
 
 /// The users table: a seam with two backends, mirroring `ChartStore`. Keeps the
@@ -133,6 +161,15 @@ pub trait AuthStore: Send + Sync {
 
     /// Fetch the full record (incl. hash) by username, for login verification.
     fn find_by_username(&self, username: &str) -> Result<Option<UserRecord>, AuthError>;
+
+    /// Store (or replace) a user's base32 TOTP secret WITHOUT enabling it — the
+    /// enroll step. Re-enroll before confirmation just overwrites the pending
+    /// secret. `totp_enabled` is untouched here.
+    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError>;
+
+    /// Flip `totp_enabled` on — the confirm step, once a code has verified against
+    /// the stored secret.
+    fn enable_totp(&self, username: &str) -> Result<(), AuthError>;
 }
 
 // --- SQLite backend ---------------------------------------------------------
@@ -165,12 +202,18 @@ impl SqliteAuthStore {
     }
 
     fn init(conn: &Connection) -> Result<(), AuthError> {
+        // ponytail: still no migration engine — the TOTP columns are added to the
+        // CREATE TABLE, not ALTER-ed onto an existing table, so a dev db created
+        // before M4-TOTP must be recreated (delete chartcraft.db). Fine for the
+        // single-box dev/bootstrap deploy; a real migration runner is future work.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
                  id            TEXT PRIMARY KEY,
                  username      TEXT NOT NULL UNIQUE,
                  display_name  TEXT NOT NULL,
                  password_hash TEXT NOT NULL,
+                 totp_secret   TEXT NULL,
+                 totp_enabled  INTEGER NOT NULL DEFAULT 0,
                  created       TEXT NOT NULL
              );",
         )?;
@@ -216,7 +259,8 @@ impl AuthStore for SqliteAuthStore {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let rec = conn
             .query_row(
-                "SELECT id, username, display_name, password_hash FROM users WHERE username = ?1",
+                "SELECT id, username, display_name, password_hash, totp_secret, totp_enabled
+                 FROM users WHERE username = ?1",
                 rusqlite::params![username],
                 |row| {
                     Ok(UserRecord {
@@ -224,11 +268,31 @@ impl AuthStore for SqliteAuthStore {
                         username: row.get(1)?,
                         display_name: row.get(2)?,
                         password_hash: row.get(3)?,
+                        totp_secret: row.get(4)?,
+                        totp_enabled: row.get::<_, i64>(5)? != 0,
                     })
                 },
             )
             .optional()?;
         Ok(rec)
+    }
+
+    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE users SET totp_secret = ?1 WHERE username = ?2",
+            rusqlite::params![secret_b32, username],
+        )?;
+        Ok(())
+    }
+
+    fn enable_totp(&self, username: &str) -> Result<(), AuthError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE users SET totp_enabled = 1 WHERE username = ?1",
+            rusqlite::params![username],
+        )?;
+        Ok(())
     }
 }
 
@@ -264,6 +328,8 @@ impl AuthStore for InMemoryAuthStore {
                 username: username.to_string(),
                 display_name: display_name.to_string(),
                 password_hash: password_hash.to_string(),
+                totp_secret: None,
+                totp_enabled: false,
             },
         );
         Ok(())
@@ -276,7 +342,25 @@ impl AuthStore for InMemoryAuthStore {
             username: u.username.clone(),
             display_name: u.display_name.clone(),
             password_hash: u.password_hash.clone(),
+            totp_secret: u.totp_secret.clone(),
+            totp_enabled: u.totp_enabled,
         }))
+    }
+
+    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
+        let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = users.get_mut(username) {
+            u.totp_secret = Some(secret_b32.to_string());
+        }
+        Ok(())
+    }
+
+    fn enable_totp(&self, username: &str) -> Result<(), AuthError> {
+        let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = users.get_mut(username) {
+            u.totp_enabled = true;
+        }
+        Ok(())
     }
 }
 
@@ -314,10 +398,10 @@ struct Session {
     principal: Principal,
     issued_at: Instant,
     last_seen: Instant,
-    // ponytail: stub for the upcoming TOTP work — records how far the session has
-    // cleared MFA (0 = password only). Unused until TOTP lands; kept minimal now so
-    // the session struct doesn't have to change shape again then.
-    auth_level: u8,
+    // How far this session has cleared authentication. A fresh register / a
+    // password-only login lands `PendingMfa`; confirming TOTP or a login that
+    // satisfies both factors lands `Full`.
+    auth_level: AuthLevel,
 }
 
 /// Everything auth needs at request time: the users table plus the server-side
@@ -449,8 +533,9 @@ impl AuthState {
         }
     }
 
-    /// Mint a fresh session for a Principal, returning the opaque cookie token.
-    pub fn create_session(&self, principal: Principal) -> String {
+    /// Mint a fresh session for a Principal at a given auth level, returning the
+    /// opaque cookie token.
+    pub fn create_session(&self, principal: Principal, level: AuthLevel) -> String {
         let token = new_session_token();
         let now = Instant::now();
         self.sessions
@@ -462,23 +547,24 @@ impl AuthState {
                     principal,
                     issued_at: now,
                     last_seen: now,
-                    auth_level: 0,
+                    auth_level: level,
                 },
             );
         token
     }
 
-    /// Resolve a session token to its Principal, if the session exists AND is not
-    /// expired. Delegates to an `at` variant so tests can drive the clock.
-    pub fn lookup_session(&self, token: &str) -> Option<Principal> {
+    /// Resolve a session token to its Principal and auth level, if the session
+    /// exists AND is not expired. Delegates to an `at` variant so tests can drive
+    /// the clock.
+    pub fn lookup_session(&self, token: &str) -> Option<(Principal, AuthLevel)> {
         self.lookup_session_at(token, Instant::now())
     }
 
     /// MF-2: like `lookup_session`, but with an explicit "now". A session past its
     /// absolute lifetime (`now - issued_at > ABSOLUTE`) or idle timeout
     /// (`now - last_seen > IDLE`) is removed and treated as absent (→ 401).
-    /// Otherwise `last_seen` is refreshed and the Principal returned.
-    fn lookup_session_at(&self, token: &str, now: Instant) -> Option<Principal> {
+    /// Otherwise `last_seen` is refreshed and the Principal + level returned.
+    fn lookup_session_at(&self, token: &str, now: Instant) -> Option<(Principal, AuthLevel)> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         match sessions.get_mut(token) {
             Some(s) if session_expired(s, now) => {
@@ -487,10 +573,91 @@ impl AuthState {
             }
             Some(s) => {
                 s.last_seen = now;
-                Some(s.principal.clone())
+                Some((s.principal.clone(), s.auth_level))
             }
             None => None,
         }
+    }
+
+    /// Promote THIS session (by token) to `Full` — the confirm step. Idempotent;
+    /// a no-op if the token is unknown (e.g. already swept).
+    pub fn promote_session(&self, token: &str) {
+        if let Some(s) = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(token)
+        {
+            s.auth_level = AuthLevel::Full;
+        }
+    }
+
+    /// Whether this user has confirmed TOTP (`totp_enabled`). Drives the
+    /// `mfaEnrolled` field, read fresh from the store (it flips mid-session).
+    pub fn mfa_enrolled(&self, username: &str) -> Result<bool, AuthError> {
+        Ok(self
+            .store
+            .find_by_username(username)?
+            .map(|u| u.totp_enabled)
+            .unwrap_or(false))
+    }
+
+    /// Enroll: generate a fresh TOTP secret for this user, store it (NOT enabled),
+    /// and return the artifacts the client needs — the `otpauth://` provisioning
+    /// URI, a base64-PNG QR of it, and the base32 secret for manual entry. The
+    /// secret is returned ONLY here and never logged. Re-enroll just regenerates.
+    ///
+    /// ponytail: re-enroll on an ALREADY-enabled account hot-swaps the secret while
+    /// `totp_enabled` stays 1 — the next login then requires codes from the NEW
+    /// secret before the admin has scanned it, so a fat-fingered enroll can lock
+    /// future logins out. The contract explicitly permits a Full session to enroll,
+    /// so this is intended; a recovery / safe re-key UX (confirm-before-swap, or
+    /// backup codes) is future work.
+    pub fn totp_enroll(&self, username: &str) -> Result<TotpEnrollment, AuthError> {
+        let secret_b32 = Secret::generate().to_base32();
+        self.store.set_totp_secret(username, &secret_b32)?;
+        let totp = build_totp(&secret_b32, username).map_err(AuthError::Db)?;
+        let otpauth_uri = totp
+            .to_url()
+            .map_err(|e| AuthError::Db(format!("totp url: {e}")))?;
+        let qr_png_base64 = totp
+            .to_qr_base64()
+            .map_err(|e| AuthError::Db(format!("totp qr: {e}")))?;
+        Ok(TotpEnrollment {
+            otpauth_uri,
+            qr_png_base64,
+            secret: secret_b32,
+        })
+    }
+
+    /// Confirm: verify `code` against the user's stored (pending) secret with ±1
+    /// step skew. On success, flip `totp_enabled` on and return `true`. A missing
+    /// secret or a wrong code returns `false` (never a hint which).
+    pub fn totp_confirm(&self, username: &str, code: &str) -> Result<bool, AuthError> {
+        if !self.totp_code_valid(username, code)? {
+            return Ok(false);
+        }
+        self.store.enable_totp(username)?;
+        Ok(true)
+    }
+
+    /// Verify a TOTP `code` against the user's stored secret (±1 step skew),
+    /// WITHOUT changing any state. Used by both confirm and login. A user with no
+    /// stored secret → `false`. Never logs the secret or the code.
+    pub fn totp_code_valid(&self, username: &str, code: &str) -> Result<bool, AuthError> {
+        let secret = match self.store.find_by_username(username)? {
+            Some(u) => u.totp_secret,
+            None => None,
+        };
+        let secret = match secret {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        let totp = match build_totp(&secret, username) {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        Ok(totp.check_current(code).is_some())
     }
 
     /// MF-2: reclaim every expired session. Called on an interval by the
@@ -515,6 +682,44 @@ impl AuthState {
 /// Minimum accepted password length (MF-3). Counts Unicode scalar values, not
 /// bytes, so a 12-char passphrase of multibyte characters still passes.
 const MIN_PASSWORD_LEN: usize = 12;
+
+// --- TOTP MFA ---------------------------------------------------------------
+
+/// The `issuer` shown in the authenticator app (and embedded in the otpauth URI).
+const TOTP_ISSUER: &str = "ChartCraft";
+/// Accepted clock skew in 30-second steps. 1 → the code for the previous OR next
+/// step also verifies (modest tolerance for client/server clock drift), no more.
+///
+/// ponytail: verification is skew-tolerant but NOT replay-proof — a code stays
+/// valid for its whole ~90 s window and can be re-submitted within it. RFC 6238
+/// leaves single-use enforcement to the caller; a used-step cache is future work,
+/// out of scope for this milestone.
+const TOTP_SKEW: u16 = 1;
+
+/// What `/auth/totp/enroll` hands back to the client. The `secret` (base32) is
+/// returned ONLY here — it's never persisted in plaintext to a log and never
+/// echoed by any other endpoint.
+pub struct TotpEnrollment {
+    pub otpauth_uri: String,
+    pub qr_png_base64: String,
+    pub secret: String,
+}
+
+/// Build a `Totp` from a base32 secret for a given account, with the fixed issuer
+/// and the modest ±1-step skew. Shared by enroll (URI/QR generation) and
+/// verification (confirm + login) so both sides agree on every parameter. Errors
+/// stringly — a bad base32 secret or a build failure both collapse to a message
+/// that never contains the secret itself.
+fn build_totp(secret_b32: &str, account: &str) -> Result<Totp, String> {
+    let secret = Secret::try_from_base32(secret_b32).map_err(|_| "invalid secret".to_string())?;
+    TotpBuilder::new()
+        .with_secret(secret)
+        .with_issuer(Some(TOTP_ISSUER))
+        .with_account_name(account)
+        .with_skew(TOTP_SKEW)
+        .build()
+        .map_err(|e: TotpError| e.to_string())
+}
 
 /// True when a session has outlived its absolute lifetime OR its idle timeout.
 fn session_expired(s: &Session, now: Instant) -> bool {
@@ -624,12 +829,26 @@ pub fn clear_session_cookie() -> String {
 
 // --- the extractor ----------------------------------------------------------
 
-/// Axum extractor: the logged-in user. A FHIR handler that takes an
-/// `AuthPrincipal` is gated — without a valid session cookie the extractor
-/// rejects with 401 + an `OperationOutcome`, and the handler never runs. Auth
-/// endpoints and static/`ServeDir` routes simply don't take this extractor, so
-/// they stay reachable logged-out.
+/// Axum extractor: a FULLY-authenticated user (password + TOTP satisfied). A FHIR
+/// handler that takes an `AuthPrincipal` is gated — without a valid session cookie
+/// the extractor rejects with 401 + an `OperationOutcome`; a valid session that
+/// has NOT cleared MFA (`PendingMfa`) is rejected with 403 ("multi-factor
+/// enrollment required"), so PHI stays behind MFA. Auth endpoints and
+/// static/`ServeDir` routes simply don't take this extractor, so they stay
+/// reachable logged-out.
 pub struct AuthPrincipal(pub Principal);
+
+/// Build the 401 both extractors share for a missing/invalid session.
+fn unauthorized_oo() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(operation_outcome(
+            "error",
+            "login",
+            "authentication required",
+        )),
+    )
+}
 
 #[async_trait]
 impl<S> FromRequestParts<S> for AuthPrincipal
@@ -641,20 +860,44 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let app = crate::AppState::from_ref(state);
-        let unauthorized = || {
-            (
-                StatusCode::UNAUTHORIZED,
+        let token = session_token_from_headers(&parts.headers).ok_or_else(unauthorized_oo)?;
+        match app.auth.lookup_session(&token) {
+            Some((principal, AuthLevel::Full)) => Ok(AuthPrincipal(principal)),
+            // A valid session that hasn't cleared MFA is authenticated but not
+            // authorized for PHI → 403, not 401.
+            Some((_, AuthLevel::PendingMfa)) => Err((
+                StatusCode::FORBIDDEN,
                 Json(operation_outcome(
                     "error",
-                    "login",
-                    "authentication required",
+                    "forbidden",
+                    "multi-factor enrollment required",
                 )),
-            )
-        };
-        let token = session_token_from_headers(&parts.headers).ok_or_else(unauthorized)?;
+            )),
+            None => Err(unauthorized_oo()),
+        }
+    }
+}
+
+/// Axum extractor: ANY valid session (PendingMfa OR Full). Used by the
+/// `/auth/totp/*` endpoints and `/auth/me`, which must be reachable by a
+/// not-yet-MFA'd session. Carries the level so a handler (e.g. `me`) can report
+/// it. A missing/invalid session → 401, same shape as `AuthPrincipal`.
+pub struct MfaPrincipal(pub Principal, pub AuthLevel);
+
+#[async_trait]
+impl<S> FromRequestParts<S> for MfaPrincipal
+where
+    crate::AppState: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let app = crate::AppState::from_ref(state);
+        let token = session_token_from_headers(&parts.headers).ok_or_else(unauthorized_oo)?;
         match app.auth.lookup_session(&token) {
-            Some(principal) => Ok(AuthPrincipal(principal)),
-            None => Err(unauthorized()),
+            Some((principal, level)) => Ok(MfaPrincipal(principal, level)),
+            None => Err(unauthorized_oo()),
         }
     }
 }
@@ -672,6 +915,7 @@ mod tests {
                 username: "alice".into(),
                 password: "s3cr3t-password".into(),
                 display_name: "Dr Alice".into(),
+                totp: String::new(),
             })
             .unwrap();
         assert_eq!(p.username, "alice");
@@ -689,6 +933,7 @@ mod tests {
                 username: "bob".into(),
                 password: "correct horse".into(),
                 display_name: "Bob".into(),
+                totp: String::new(),
             })
             .unwrap();
         assert!(state.verify("bob", "correct horse").unwrap().is_some());
@@ -705,7 +950,7 @@ mod tests {
             username: "u".into(),
             display_name: "U".into(),
         };
-        let token = state.create_session(p);
+        let token = state.create_session(p, AuthLevel::Full);
         assert!(state.lookup_session(&token).is_some());
         state.destroy_session(&token);
         assert!(state.lookup_session(&token).is_none());
@@ -756,7 +1001,7 @@ mod tests {
     fn expired_session_is_rejected_by_lookup() {
         let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
         let p = Principal { id: "u1".into(), username: "u".into(), display_name: "U".into() };
-        let token = state.create_session(p);
+        let token = state.create_session(p, AuthLevel::Full);
         let base = Instant::now();
 
         // Idle timeout: last_seen too old → None, and the entry is purged.
@@ -777,7 +1022,7 @@ mod tests {
         // the last refresh, so a None there can ONLY come from the absolute branch.
         let token2 = state.create_session(Principal {
             id: "u2".into(), username: "u2".into(), display_name: "U2".into(),
-        });
+        }, AuthLevel::Full);
         let t0 = Instant::now();
         let step = Duration::from_secs(20 * 60);
         let mut t = step;
@@ -801,7 +1046,7 @@ mod tests {
         let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
         let token = state.create_session(Principal {
             id: "u".into(), username: "u".into(), display_name: "U".into(),
-        });
+        }, AuthLevel::Full);
         let now = Instant::now();
         state.sweep_expired(now + SESSION_ABSOLUTE + Duration::from_secs(1));
         assert!(
@@ -818,6 +1063,7 @@ mod tests {
             username: "   ".into(),
             password: "a-perfectly-long-password".into(),
             display_name: "X".into(),
+            totp: String::new(),
         });
         assert!(matches!(blank, Err(AuthError::InvalidInput(_))), "blank username rejected");
 
@@ -825,6 +1071,7 @@ mod tests {
             username: "admin".into(),
             password: "short".into(), // < 12 chars
             display_name: "X".into(),
+            totp: String::new(),
         });
         assert!(matches!(short, Err(AuthError::InvalidInput(_))), "short password rejected");
 
@@ -833,6 +1080,7 @@ mod tests {
             username: "admin".into(),
             password: "twelve-chars-ok".into(),
             display_name: "Admin".into(),
+            totp: String::new(),
         });
         assert!(ok.is_ok(), "valid bootstrap registers");
     }

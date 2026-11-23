@@ -41,8 +41,8 @@ use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
 use auth::{
-    clear_session_cookie, set_session_cookie, AuthPrincipal, AuthState, Credentials,
-    SqliteAuthStore,
+    clear_session_cookie, set_session_cookie, AuthLevel, AuthPrincipal, AuthState, Credentials,
+    MfaPrincipal, SqliteAuthStore,
 };
 use fhir::{capability_statement, is_supported, now_iso8601, operation_outcome};
 use store::{ChartStore, SqliteStore, WriteOp};
@@ -343,9 +343,17 @@ async fn metadata(_principal: AuthPrincipal) -> (StatusCode, Json<Value>) {
 
 // --- auth handlers ----------------------------------------------------------
 
-/// The success body shared by register/login/me: the public user identity.
-fn principal_json(p: &auth::Principal) -> Value {
-    json!({"id": p.id, "username": p.username, "displayName": p.display_name})
+/// The success body shared by register/login/me: the public user identity plus
+/// its MFA state. `mfa_enrolled` is read fresh from the store (it flips at
+/// confirm), and `level` is the session's current auth level.
+fn principal_json(p: &auth::Principal, mfa_enrolled: bool, level: AuthLevel) -> Value {
+    json!({
+        "id": p.id,
+        "username": p.username,
+        "displayName": p.display_name,
+        "mfaEnrolled": mfa_enrolled,
+        "authLevel": level.as_str(),
+    })
 }
 
 /// A JSON error with a `{"error": ...}` shape, for the auth endpoints (the
@@ -392,8 +400,10 @@ async fn register(
         Err(e) => return auth_server_error(&e.to_string()),
     };
 
-    let body = principal_json(&principal);
-    let token = auth.create_session(principal);
+    // A fresh register has not enrolled TOTP yet → PendingMfa session, and the
+    // body reports mfaEnrolled:false / authLevel:"pending".
+    let body = principal_json(&principal, false, AuthLevel::PendingMfa);
+    let token = auth.create_session(principal, AuthLevel::PendingMfa);
     (
         StatusCode::CREATED,
         AppendHeaders([(SET_COOKIE, set_session_cookie(&token))]),
@@ -432,10 +442,39 @@ async fn login(
 
     match verify_result {
         Ok(Some(principal)) => {
+            // Password is correct. Second factor gates the SESSION LEVEL.
+            let enrolled = match auth.mfa_enrolled(&principal.username) {
+                Ok(e) => e,
+                Err(e) => return auth_server_error(&e.to_string()),
+            };
+
+            let level = if enrolled {
+                // TOTP is required: verify the submitted code. A missing or wrong
+                // code is a login FAILURE — same generic 401 as a wrong password,
+                // so the client can't tell which factor failed — and it counts
+                // toward the lockout.
+                let code_ok = match auth.totp_code_valid(&principal.username, &creds.totp) {
+                    Ok(ok) => ok,
+                    Err(e) => return auth_server_error(&e.to_string()),
+                };
+                if !code_ok {
+                    auth.record_failure(&creds.username);
+                    return auth_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid username or password",
+                    );
+                }
+                AuthLevel::Full
+            } else {
+                // Not enrolled: a correct password yields a PendingMfa session that
+                // can only reach `/auth/totp/*` to finish enrollment.
+                AuthLevel::PendingMfa
+            };
+
             // MF-1: a clean login clears the failure counter.
             auth.record_success(&creds.username);
-            let body = principal_json(&principal);
-            let token = auth.create_session(principal);
+            let body = principal_json(&principal, enrolled, level);
+            let token = auth.create_session(principal, level);
             (
                 StatusCode::OK,
                 AppendHeaders([(SET_COOKIE, set_session_cookie(&token))]),
@@ -469,10 +508,71 @@ async fn logout(
 }
 
 /// GET /auth/me — the current session's user, 200; or 401 if unauthenticated.
-/// Takes `AuthPrincipal` so the extractor supplies the 401 on a missing/invalid
-/// session (as a JSON OperationOutcome, same as the gated FHIR routes).
-async fn me(AuthPrincipal(principal): AuthPrincipal) -> (StatusCode, Json<Value>) {
-    (StatusCode::OK, Json(principal_json(&principal)))
+/// Takes `MfaPrincipal` (ANY valid session — PendingMfa or Full), so a fresh
+/// register / pre-MFA session can still read its own identity and `authLevel`.
+/// The extractor supplies the 401 on a missing/invalid session.
+async fn me(
+    State(auth): State<Arc<AuthState>>,
+    MfaPrincipal(principal, level): MfaPrincipal,
+) -> axum::response::Response {
+    let enrolled = match auth.mfa_enrolled(&principal.username) {
+        Ok(e) => e,
+        Err(e) => return auth_server_error(&e.to_string()),
+    };
+    (StatusCode::OK, Json(principal_json(&principal, enrolled, level))).into_response()
+}
+
+/// POST /auth/totp/enroll — generate (or regenerate) a TOTP secret for the
+/// logged-in user and return the provisioning artifacts. Requires ANY valid
+/// session (PendingMfa or Full). The secret is stored but NOT yet enabled; the
+/// client must `confirm` a code before TOTP takes effect. Returns
+/// `{otpauthUri, qrPngBase64, secret}` — the secret is surfaced ONLY here.
+async fn totp_enroll(
+    State(auth): State<Arc<AuthState>>,
+    MfaPrincipal(principal, _level): MfaPrincipal,
+) -> axum::response::Response {
+    match auth.totp_enroll(&principal.username) {
+        Ok(e) => (
+            StatusCode::OK,
+            Json(json!({
+                "otpauthUri": e.otpauth_uri,
+                "qrPngBase64": e.qr_png_base64,
+                "secret": e.secret,
+            })),
+        )
+            .into_response(),
+        Err(e) => auth_server_error(&e.to_string()),
+    }
+}
+
+/// POST /auth/totp/confirm {code} — verify `code` against the user's stored
+/// (pending) secret with ±1-step skew. Requires ANY valid session. On success,
+/// enable TOTP, promote THIS session to `Full`, and return
+/// `{mfaEnrolled:true, authLevel:"full"}`, 200. A wrong code → generic 400.
+async fn totp_confirm(
+    State(auth): State<Arc<AuthState>>,
+    headers: axum::http::HeaderMap,
+    MfaPrincipal(principal, _level): MfaPrincipal,
+    Json(body): Json<Value>,
+) -> axum::response::Response {
+    let code = body.get("code").and_then(Value::as_str).unwrap_or("");
+    match auth.totp_confirm(&principal.username, code) {
+        Ok(true) => {
+            // Promote THIS session (identified by its cookie) to Full. The caller
+            // already presented a valid session cookie to pass the extractor, so
+            // the token is present.
+            if let Some(token) = auth::session_token_from_headers(&headers) {
+                auth.promote_session(&token);
+            }
+            (
+                StatusCode::OK,
+                Json(json!({"mfaEnrolled": true, "authLevel": AuthLevel::Full.as_str()})),
+            )
+                .into_response()
+        }
+        Ok(false) => auth_error(StatusCode::BAD_REQUEST, "invalid code"),
+        Err(e) => auth_server_error(&e.to_string()),
+    }
 }
 
 // --- shared handler logic ---------------------------------------------------
@@ -613,6 +713,10 @@ fn app(state: AppState) -> Router {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        // TOTP MFA — reachable by ANY valid session (PendingMfa or Full) via the
+        // `MfaPrincipal` extractor, so a not-yet-enrolled session can finish setup.
+        .route("/auth/totp/enroll", post(totp_enroll))
+        .route("/auth/totp/confirm", post(totp_confirm))
         .route("/metadata", get(metadata))
         // Instance operation: a 3-segment literal-tail route. It does NOT collide
         // with the 2-segment `/:resource_type/:id` param route below; axum matches
@@ -1721,5 +1825,225 @@ mod tests {
                 && e["agent"][0]["who"]["display"] == json!("Dr Xyz")
         });
         assert!(audited, "AuditEvent must record the real principal as actor");
+    }
+
+    // --- M4 TOTP MFA tests --------------------------------------------------
+
+    /// Compute a valid current TOTP code from a base32 secret, rebuilding the
+    /// `Totp` with the SAME parameters the server uses (issuer "ChartCraft",
+    /// account = username, ±1-step skew) so the code the test submits matches what
+    /// the server verifies.
+    fn current_totp_code(secret_b32: &str, username: &str) -> String {
+        use totp_rs::{Builder as TotpBuilder, Secret};
+        TotpBuilder::new()
+            .with_secret(Secret::try_from_base32(secret_b32).unwrap())
+            .with_issuer(Some("ChartCraft"))
+            .with_account_name(username)
+            .with_skew(1)
+            .build()
+            .unwrap()
+            .generate_current()
+            .to_string()
+    }
+
+    /// Register an admin and return the login/session cookie (PendingMfa).
+    async fn register_admin(app: &Router, username: &str) -> String {
+        let (_, cookie, _) = send(
+            app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": username, "password": "a-long-enough-pw", "displayName": "Admin"})),
+        )
+        .await;
+        cookie_pair(&cookie.expect("register sets a session cookie"))
+    }
+
+    /// A fresh register yields a PendingMfa session, and `/auth/me` reports it.
+    #[tokio::test]
+    async fn register_yields_pending_mfa_session() {
+        let app = app(mem_app_state());
+        let (code, _, body) = send(
+            &app,
+            "POST",
+            "/auth/register",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "displayName": "Admin"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(body["mfaEnrolled"], json!(false));
+        assert_eq!(body["authLevel"], json!("pending"));
+    }
+
+    /// A PendingMfa session is REFUSED (403) at a FHIR endpoint, but may reach the
+    /// TOTP endpoints.
+    #[tokio::test]
+    async fn pending_mfa_session_is_403_on_fhir() {
+        let app = app(mem_app_state());
+        let cookie = register_admin(&app, "admin").await;
+
+        // FHIR read is 403 (authenticated, but not MFA-cleared) with an
+        // OperationOutcome — NOT a 401 (that's for no session at all).
+        let (code, _, body) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body["resourceType"], "OperationOutcome");
+
+        // /metadata is gated the same way.
+        let (code, _, _) = send(&app, "GET", "/metadata", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+
+        // But /auth/me and the enroll endpoint ARE reachable for a PendingMfa session.
+        let (code, _, _) = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let (code, _, _) = send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// enroll → confirm promotes THIS session to Full, which can then read FHIR.
+    #[tokio::test]
+    async fn enroll_confirm_promotes_session_and_unlocks_fhir() {
+        let app = app(mem_app_state());
+        let cookie = register_admin(&app, "admin").await;
+
+        // Enroll returns the otpauth URI, a base64 PNG QR, and the base32 secret.
+        let (code, _, body) = send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let secret = body["secret"].as_str().expect("enroll returns the secret").to_string();
+        assert!(body["otpauthUri"].as_str().unwrap().starts_with("otpauth://totp/"));
+        assert!(!body["qrPngBase64"].as_str().unwrap().is_empty(), "QR PNG base64");
+
+        // Before confirm, the session is still PendingMfa → FHIR is 403.
+        let (code, _, _) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+
+        // Confirm with a valid current code → 200, mfaEnrolled:true, authLevel:full.
+        let code_val = current_totp_code(&secret, "admin");
+        let (code, _, body) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&cookie),
+            Some(json!({"code": code_val})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["mfaEnrolled"], json!(true));
+        assert_eq!(body["authLevel"], json!("full"));
+
+        // The SAME session is now Full and can read FHIR (empty searchset, 200).
+        let (code, _, body) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["resourceType"], "Bundle");
+
+        // /auth/me now reports the promoted level.
+        let (_, _, me_body) = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        assert_eq!(me_body["mfaEnrolled"], json!(true));
+        assert_eq!(me_body["authLevel"], json!("full"));
+    }
+
+    /// Confirm with a WRONG code → generic 400, no promotion, still 403 on FHIR.
+    #[tokio::test]
+    async fn confirm_with_wrong_code_is_400_and_no_promotion() {
+        let app = app(mem_app_state());
+        let cookie = register_admin(&app, "admin").await;
+        send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&cookie),
+            Some(json!({"code": "000000"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+
+        // Session was NOT promoted — FHIR is still 403.
+        let (code, _, _) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::FORBIDDEN);
+    }
+
+    /// Once TOTP is enabled, login requires a valid code: none → 401, wrong → 401,
+    /// correct → Full 200.
+    #[tokio::test]
+    async fn login_with_totp_enabled_requires_a_valid_code() {
+        let app = app(mem_app_state());
+        let cookie = register_admin(&app, "admin").await;
+
+        // Enroll + confirm so totp_enabled is set.
+        let (_, _, body) = send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+        let secret = body["secret"].as_str().unwrap().to_string();
+        let good = current_totp_code(&secret, "admin");
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&cookie),
+            Some(json!({"code": good})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // Login with password only (no code) → generic 401, no cookie.
+        let (code, nocode_cookie, body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], json!("invalid username or password"));
+        assert!(nocode_cookie.is_none(), "no session cookie on a failed login");
+
+        // Login with a WRONG code → same generic 401.
+        let (code, _, body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": "000000"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"], json!("invalid username or password"));
+
+        // Login with the CORRECT current code → Full 200, mfaEnrolled:true.
+        let good = current_totp_code(&secret, "admin");
+        let (code, login_cookie, body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": good})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["mfaEnrolled"], json!(true));
+        assert_eq!(body["authLevel"], json!("full"));
+
+        // The fresh session from that login is Full and can read FHIR.
+        let login_cookie = cookie_pair(&login_cookie.unwrap());
+        let (code, _, _) = send(&app, "GET", "/Patient", Some(&login_cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// The TOTP endpoints reject an unauthenticated caller with 401.
+    #[tokio::test]
+    async fn totp_endpoints_require_a_session() {
+        let app = app(mem_app_state());
+        let (code, _, _) = send(&app, "POST", "/auth/totp/enroll", None, None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            None,
+            Some(json!({"code": "123456"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
     }
 }
