@@ -5,6 +5,17 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Clinician-first, FHIR-native, open-source EMR in Rust (Milestone 4: local password auth + sessions + access control + real Provenance/AuditEvent signer, on top of FHIR CRUD/search, versioned hash-chained store, superbill, and static web serving)"
 
+# The embeddable core as a library (so a downstream crate can depend on it), plus
+# a thin binary that wires it up. Declared explicitly, though Cargo would also
+# auto-detect both from src/lib.rs + src/main.rs.
+[lib]
+name = "chartcraft"
+path = "src/lib.rs"
+
+[[bin]]
+name = "chartcraft"
+path = "src/main.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
