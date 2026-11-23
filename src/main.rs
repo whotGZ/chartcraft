@@ -522,16 +522,28 @@ async fn me(
     (StatusCode::OK, Json(principal_json(&principal, enrolled, level))).into_response()
 }
 
-/// POST /auth/totp/enroll — generate (or regenerate) a TOTP secret for the
-/// logged-in user and return the provisioning artifacts. Requires ANY valid
-/// session (PendingMfa or Full). The secret is stored but NOT yet enabled; the
-/// client must `confirm` a code before TOTP takes effect. Returns
-/// `{otpauthUri, qrPngBase64, secret}` — the secret is surfaced ONLY here.
+/// POST /auth/totp/enroll — stage a TOTP secret for the logged-in user and return
+/// the provisioning artifacts. Requires ANY valid session (PendingMfa or Full).
+/// The secret is staged (pending) but NOT yet live; the client must `confirm` a
+/// code before TOTP takes effect. Returns `{otpauthUri, qrPngBase64, secret}` —
+/// the secret is surfaced ONLY here.
+///
+/// M1/M2: for a not-yet-enrolled user this is idempotent (a reload returns the
+/// same pending secret, not a fresh one). For an ALREADY-enrolled user it is a
+/// re-key that REQUIRES re-authentication — the body must carry a current valid
+/// `code` (verified against the LIVE secret); a missing/invalid code is rejected
+/// with a generic 401 and touches no secret. The body is OPTIONAL so a pending
+/// user's body-less POST (the enroll contract) still reaches the handler.
 async fn totp_enroll(
     State(auth): State<Arc<AuthState>>,
     MfaPrincipal(principal, _level): MfaPrincipal,
+    body: Option<Json<Value>>,
 ) -> axum::response::Response {
-    match auth.totp_enroll(&principal.username) {
+    let code = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("code").and_then(Value::as_str))
+        .unwrap_or("");
+    match auth.totp_enroll(&principal.username, code) {
         Ok(e) => (
             StatusCode::OK,
             Json(json!({
@@ -541,36 +553,63 @@ async fn totp_enroll(
             })),
         )
             .into_response(),
+        // M1/M2: a re-key without a valid current code → generic 401, no secret
+        // touched (no hint whether the code was missing vs wrong).
+        Err(auth::AuthError::ReauthRequired) => {
+            auth_error(StatusCode::UNAUTHORIZED, "re-authentication required")
+        }
         Err(e) => auth_server_error(&e.to_string()),
     }
 }
 
-/// POST /auth/totp/confirm {code} — verify `code` against the user's stored
-/// (pending) secret with ±1-step skew. Requires ANY valid session. On success,
-/// enable TOTP, promote THIS session to `Full`, and return
-/// `{mfaEnrolled:true, authLevel:"full"}`, 200. A wrong code → generic 400.
+/// POST /auth/totp/confirm {code} — verify `code` against the user's PENDING
+/// secret with ±1-step skew. Requires ANY valid session. On success, atomically
+/// promote the pending secret to live (enabling TOTP), promote THIS session to
+/// `Full`, and return `{mfaEnrolled:true, authLevel:"full"}`, 200. A wrong code →
+/// generic 400.
+///
+/// N3: confirm gates the re-key path, so it carries the SAME username-keyed
+/// lockout as login — a locked user is refused with 429 before any verify, and a
+/// wrong code counts toward the lockout. N2: on success THIS pre-MFA token is
+/// destroyed and a FRESH `Full` session token is minted (session-fixation hygiene).
 async fn totp_confirm(
     State(auth): State<Arc<AuthState>>,
     headers: axum::http::HeaderMap,
     MfaPrincipal(principal, _level): MfaPrincipal,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
+    // N3: refuse a locked-out username before any verify work.
+    if auth.is_locked(&principal.username) {
+        return auth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many attempts, try again later",
+        );
+    }
+
     let code = body.get("code").and_then(Value::as_str).unwrap_or("");
     match auth.totp_confirm(&principal.username, code) {
         Ok(true) => {
-            // Promote THIS session (identified by its cookie) to Full. The caller
-            // already presented a valid session cookie to pass the extractor, so
-            // the token is present.
-            if let Some(token) = auth::session_token_from_headers(&headers) {
-                auth.promote_session(&token);
+            // N3: a clean confirm clears the failure counter.
+            auth.record_success(&principal.username);
+            // N2: rotate the session token. Destroy the pre-MFA token and mint a
+            // fresh Full session, so the token that existed before the second factor
+            // was proven is invalidated. The new cookie is set below.
+            if let Some(old) = auth::session_token_from_headers(&headers) {
+                auth.destroy_session(&old);
             }
+            let token = auth.create_session(principal, AuthLevel::Full);
             (
                 StatusCode::OK,
+                AppendHeaders([(SET_COOKIE, set_session_cookie(&token))]),
                 Json(json!({"mfaEnrolled": true, "authLevel": AuthLevel::Full.as_str()})),
             )
                 .into_response()
         }
-        Ok(false) => auth_error(StatusCode::BAD_REQUEST, "invalid code"),
+        Ok(false) => {
+            // N3: a wrong code counts toward the lockout.
+            auth.record_failure(&principal.username);
+            auth_error(StatusCode::BAD_REQUEST, "invalid code")
+        }
         Err(e) => auth_server_error(&e.to_string()),
     }
 }
@@ -742,8 +781,48 @@ fn app(state: AppState) -> Router {
         .fallback_service(ServeDir::new("web"))
 }
 
+/// M5 break-glass: `chartcraft --reset-mfa <username>` clears a user's TOTP state
+/// (live secret, pending secret, `totp_enabled`) so they re-enroll on next login —
+/// the recovery path for a lost authenticator. Handled BEFORE the server starts;
+/// opens only the auth store, performs the reset, prints a confirmation, and exits.
+/// Returns `true` when the flag was present (so `main` should not start the server).
+fn maybe_reset_mfa() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let idx = match args.iter().position(|a| a == "--reset-mfa") {
+        Some(i) => i,
+        None => return false,
+    };
+    let username = match args.get(idx + 1) {
+        Some(u) if !u.is_empty() => u,
+        _ => {
+            eprintln!("usage: chartcraft --reset-mfa <username>");
+            std::process::exit(2);
+        }
+    };
+    let auth_store = SqliteAuthStore::open("chartcraft.db").expect("open auth store");
+    let auth = AuthState::new(Box::new(auth_store));
+    match auth.reset_mfa(username) {
+        Ok(true) => {
+            println!("MFA reset for '{username}'; they will re-enroll TOTP on next login.");
+            std::process::exit(0);
+        }
+        Ok(false) => {
+            eprintln!("no such user: '{username}'");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[chartcraft] --reset-mfa failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // M5: handle the break-glass CLI flag before any server setup. It exits the
+    // process, so control only returns here when the flag was absent.
+    maybe_reset_mfa();
+
     let store: SharedStore =
         Arc::new(SqliteStore::open("chartcraft.db").expect("open chartcraft.db"));
     // Auth store shares the db FILE but owns its own connection — the clinical
@@ -1834,7 +1913,19 @@ mod tests {
     /// account = username, ±1-step skew) so the code the test submits matches what
     /// the server verifies.
     fn current_totp_code(secret_b32: &str, username: &str) -> String {
+        totp_code_at(secret_b32, username, 0)
+    }
+
+    /// N1: generate a TOTP code for a step `offset_steps` 30-second windows from
+    /// now. With the server's ±1 skew, the code for `now + 30` (offset 1) verifies
+    /// *now* and sits at a STRICTLY greater step than the current one — so a test
+    /// that must verify twice in quick succession (confirm, then login/re-enroll)
+    /// uses a distinct, fresh step each time and dodges N1's replay rejection.
+    fn totp_code_at(secret_b32: &str, username: &str, offset_steps: i64) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
         use totp_rs::{Builder as TotpBuilder, Secret};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let at = (now + offset_steps * 30).max(0) as u64;
         TotpBuilder::new()
             .with_secret(Secret::try_from_base32(secret_b32).unwrap())
             .with_issuer(Some("ChartCraft"))
@@ -1842,7 +1933,7 @@ mod tests {
             .with_skew(1)
             .build()
             .unwrap()
-            .generate_current()
+            .generate(at)
             .to_string()
     }
 
@@ -1919,7 +2010,7 @@ mod tests {
 
         // Confirm with a valid current code → 200, mfaEnrolled:true, authLevel:full.
         let code_val = current_totp_code(&secret, "admin");
-        let (code, _, body) = send(
+        let (code, confirm_cookie, body) = send(
             &app,
             "POST",
             "/auth/totp/confirm",
@@ -1931,13 +2022,20 @@ mod tests {
         assert_eq!(body["mfaEnrolled"], json!(true));
         assert_eq!(body["authLevel"], json!("full"));
 
-        // The SAME session is now Full and can read FHIR (empty searchset, 200).
-        let (code, _, body) = send(&app, "GET", "/Patient", Some(&cookie), None).await;
+        // N2: confirm rotated the session token — it set a FRESH cookie, and the
+        // OLD pre-MFA cookie is now dead.
+        let full_cookie = cookie_pair(&confirm_cookie.expect("confirm rotates the session cookie"));
+        assert_ne!(full_cookie, cookie, "a fresh token is minted at promotion");
+        let (code, _, _) = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "the pre-MFA token is invalidated");
+
+        // The NEW (rotated) session is Full and can read FHIR (empty searchset, 200).
+        let (code, _, body) = send(&app, "GET", "/Patient", Some(&full_cookie), None).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["resourceType"], "Bundle");
 
         // /auth/me now reports the promoted level.
-        let (_, _, me_body) = send(&app, "GET", "/auth/me", Some(&cookie), None).await;
+        let (_, _, me_body) = send(&app, "GET", "/auth/me", Some(&full_cookie), None).await;
         assert_eq!(me_body["mfaEnrolled"], json!(true));
         assert_eq!(me_body["authLevel"], json!("full"));
     }
@@ -2010,8 +2108,10 @@ mod tests {
         assert_eq!(code, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"], json!("invalid username or password"));
 
-        // Login with the CORRECT current code → Full 200, mfaEnrolled:true.
-        let good = current_totp_code(&secret, "admin");
+        // Login with the CORRECT code → Full 200, mfaEnrolled:true. N1: confirm
+        // above consumed the current step, so use the next step (+1), which is
+        // still valid now under ±1 skew but is a strictly fresher step.
+        let good = totp_code_at(&secret, "admin", 1);
         let (code, login_cookie, body) = send(
             &app,
             "POST",
@@ -2028,6 +2128,211 @@ mod tests {
         let login_cookie = cookie_pair(&login_cookie.unwrap());
         let (code, _, _) = send(&app, "GET", "/Patient", Some(&login_cookie), None).await;
         assert_eq!(code, StatusCode::OK);
+    }
+
+    /// Helper: register an admin and fully enroll+confirm TOTP, returning the
+    /// base32 secret and the FRESH (post-N2-rotation) Full session cookie.
+    async fn enroll_confirmed_admin(app: &Router, username: &str) -> (String, String) {
+        let pending_cookie = register_admin(app, username).await;
+        let (_, _, body) =
+            send(app, "POST", "/auth/totp/enroll", Some(&pending_cookie), None).await;
+        let secret = body["secret"].as_str().unwrap().to_string();
+        let code = current_totp_code(&secret, username);
+        let (code_status, full_cookie, _) = send(
+            app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&pending_cookie),
+            Some(json!({"code": code})),
+        )
+        .await;
+        assert_eq!(code_status, StatusCode::OK);
+        (secret, cookie_pair(&full_cookie.expect("confirm sets a fresh cookie")))
+    }
+
+    /// M6: with TOTP enabled, repeated WRONG codes at login arm the lockout — the
+    /// 6th attempt is 429 — proving an invalid TOTP counts toward throttling.
+    #[tokio::test]
+    async fn repeated_wrong_totp_codes_lock_out_then_429() {
+        let app = app(mem_app_state());
+        enroll_confirmed_admin(&app, "admin").await;
+
+        // Five password-correct / code-wrong logins: each a plain 401 (below cap).
+        for _ in 0..5 {
+            let (code, _, _) = send(
+                &app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": "000000"})),
+            )
+            .await;
+            assert_eq!(code, StatusCode::UNAUTHORIZED);
+        }
+
+        // The 6th — even with the right password — is refused as 429. (We don't
+        // supply a valid code; the point is the lockout short-circuits first.)
+        let (code, cookie, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": "000000"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::TOO_MANY_REQUESTS, "invalid TOTP counts toward the lockout");
+        assert!(cookie.is_none());
+    }
+
+    /// M6: the TOTP secret must NEVER appear in a `/auth/me` body nor in a `login`
+    /// response body — it's surfaced only by `enroll`.
+    #[tokio::test]
+    async fn totp_secret_never_leaks_in_me_or_login_bodies() {
+        let app = app(mem_app_state());
+        let (secret, full_cookie) = enroll_confirmed_admin(&app, "admin").await;
+
+        // /auth/me (Full session) must not contain the secret anywhere in its body.
+        let (code, _, me_body) = send(&app, "GET", "/auth/me", Some(&full_cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(
+            !me_body.to_string().contains(&secret),
+            "the TOTP secret must never appear in /auth/me"
+        );
+
+        // A successful login body must not contain the secret either. Use a fresh
+        // step (+1) for the code since confirm already consumed the current one.
+        let good = totp_code_at(&secret, "admin", 1);
+        let (code, _, login_body) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": good})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(
+            !login_body.to_string().contains(&secret),
+            "the TOTP secret must never appear in a login response"
+        );
+    }
+
+    /// M1/M2 + M6: an enabled user's re-enroll WITHOUT a current code is rejected
+    /// (401), no secret is touched, and the live secret still works afterward.
+    #[tokio::test]
+    async fn reenroll_without_current_code_is_rejected_and_live_secret_survives() {
+        let app = app(mem_app_state());
+        let (secret, full_cookie) = enroll_confirmed_admin(&app, "admin").await;
+
+        // Re-enroll with no body → 401 (re-authentication required).
+        let (code, _, _) = send(&app, "POST", "/auth/totp/enroll", Some(&full_cookie), None).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "re-key needs a current code");
+
+        // Re-enroll with a WRONG code → also 401.
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/totp/enroll",
+            Some(&full_cookie),
+            Some(json!({"code": "000000"})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        // The ORIGINAL live secret still authenticates a fresh login (nothing was
+        // swapped). Use step +1 (confirm consumed the current step).
+        let good = totp_code_at(&secret, "admin", 1);
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": good})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "the live secret still works after a rejected re-key");
+    }
+
+    /// M1: enroll is idempotent for a not-yet-enrolled user — a reload returns the
+    /// SAME pending secret/URI (so an already-scanned QR is never invalidated), and
+    /// that reused secret is the one a confirm promotes.
+    #[tokio::test]
+    async fn enroll_reload_is_idempotent_for_pending_user() {
+        let app = app(mem_app_state());
+        let cookie = register_admin(&app, "admin").await;
+
+        // First enroll stages a pending secret.
+        let (code, _, b1) = send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        let secret1 = b1["secret"].as_str().unwrap().to_string();
+        let uri1 = b1["otpauthUri"].as_str().unwrap().to_string();
+
+        // Reloading enroll returns the SAME secret/URI — no rotation.
+        let (code, _, b2) = send(&app, "POST", "/auth/totp/enroll", Some(&cookie), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(b2["secret"].as_str().unwrap(), secret1, "reload must not rotate the pending secret");
+        assert_eq!(b2["otpauthUri"].as_str().unwrap(), uri1, "same provisioning URI");
+
+        // A code from that (stable) pending secret confirms and promotes.
+        let code_val = current_totp_code(&secret1, "admin");
+        let (status, _, body) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&cookie),
+            Some(json!({"code": code_val})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mfaEnrolled"], json!(true));
+    }
+
+    /// N1 + M6: a replayed code (same step) is rejected. Confirm consumes step S;
+    /// a login that submits the SAME step-S code is refused even with the right
+    /// password, while a fresh-step code then succeeds.
+    #[tokio::test]
+    async fn replayed_totp_code_is_rejected() {
+        let app = app(mem_app_state());
+        let pending_cookie = register_admin(&app, "admin").await;
+        let (_, _, body) =
+            send(&app, "POST", "/auth/totp/enroll", Some(&pending_cookie), None).await;
+        let secret = body["secret"].as_str().unwrap().to_string();
+
+        // Confirm consumes the current step S.
+        let step_s = current_totp_code(&secret, "admin");
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/totp/confirm",
+            Some(&pending_cookie),
+            Some(json!({"code": step_s.clone()})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        // Replaying the SAME step-S code at login is rejected (N1), even though the
+        // password is correct and the code is otherwise still in its window.
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": step_s})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "a replayed (already-used) step is rejected");
+
+        // A fresh-step code (S+1) then logs in successfully.
+        let fresh = totp_code_at(&secret, "admin", 1);
+        let (code, _, _) = send(
+            &app,
+            "POST",
+            "/auth/login",
+            None,
+            Some(json!({"username": "admin", "password": "a-long-enough-pw", "totp": fresh})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "a fresh step still authenticates");
     }
 
     /// The TOTP endpoints reject an unauthenticated caller with 401.

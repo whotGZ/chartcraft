@@ -107,6 +107,9 @@ pub enum AuthError {
     /// password) — surfaces as a 400 upstream. The message is safe to show the
     /// client (it names the policy, never internal/DB detail).
     InvalidInput(&'static str),
+    /// M1/M2: a re-enroll by an already-enabled user arrived without a valid current
+    /// TOTP code. Surfaces as a generic 401 upstream; no secret is touched.
+    ReauthRequired,
 }
 
 impl std::fmt::Display for AuthError {
@@ -115,6 +118,7 @@ impl std::fmt::Display for AuthError {
             AuthError::Db(m) => write!(f, "auth store error: {m}"),
             AuthError::UsernameTaken => write!(f, "username already taken"),
             AuthError::InvalidInput(m) => write!(f, "{m}"),
+            AuthError::ReauthRequired => write!(f, "re-authentication required"),
         }
     }
 }
@@ -126,8 +130,12 @@ impl From<rusqlite::Error> for AuthError {
 }
 
 /// A persisted user row, including the argon2 PHC hash (used only for verify) and
-/// the TOTP enrollment state. `totp_secret` is the base32 shared secret, set at
-/// enroll (NULL until then); `totp_enabled` flips true at confirm.
+/// the TOTP enrollment state. `totp_secret` is the LIVE base32 shared secret (the
+/// one login verifies against, NULL until the first confirm); `totp_enabled` flips
+/// true at the first confirm. `pending_totp_secret` is a STAGING slot (M1/M2): a
+/// freshly enrolled or re-keyed secret lives here until a code confirms it, at
+/// which point it is atomically promoted into `totp_secret`. The live secret keeps
+/// working throughout, so a re-key never strands the user.
 pub struct UserRecord {
     id: String,
     username: String,
@@ -135,6 +143,7 @@ pub struct UserRecord {
     password_hash: String,
     totp_secret: Option<String>,
     totp_enabled: bool,
+    pending_totp_secret: Option<String>,
 }
 
 /// The users table: a seam with two backends, mirroring `ChartStore`. Keeps the
@@ -162,14 +171,24 @@ pub trait AuthStore: Send + Sync {
     /// Fetch the full record (incl. hash) by username, for login verification.
     fn find_by_username(&self, username: &str) -> Result<Option<UserRecord>, AuthError>;
 
-    /// Store (or replace) a user's base32 TOTP secret WITHOUT enabling it — the
-    /// enroll step. Re-enroll before confirmation just overwrites the pending
-    /// secret. `totp_enabled` is untouched here.
-    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError>;
+    /// Stage a base32 TOTP secret in the PENDING slot (M1/M2) without touching the
+    /// live `totp_secret` or `totp_enabled`. The enroll step writes here; a later
+    /// confirm promotes it. Overwriting a pending secret is fine (a fresh enroll
+    /// before confirmation).
+    fn set_pending_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError>;
 
-    /// Flip `totp_enabled` on — the confirm step, once a code has verified against
-    /// the stored secret.
-    fn enable_totp(&self, username: &str) -> Result<(), AuthError>;
+    /// Atomically PROMOTE the pending secret to live (M1/M2 confirm): move
+    /// `pending_totp_secret` → `totp_secret`, set `totp_enabled=1`, clear the
+    /// pending slot. A no-op (returns `Ok(false)`) when there is no pending secret
+    /// to promote; `Ok(true)` when a row was promoted. Atomic so a re-key swaps the
+    /// live secret only once the new one is proven — the old one works until then.
+    fn promote_pending_totp(&self, username: &str) -> Result<bool, AuthError>;
+
+    /// Clear ALL TOTP state (M5 break-glass): drop the live secret, the pending
+    /// secret, and `totp_enabled`, so the user re-enrolls on next login. Returns
+    /// `Ok(true)` if a matching user row was cleared, `Ok(false)` if the username
+    /// was unknown.
+    fn clear_totp(&self, username: &str) -> Result<bool, AuthError>;
 }
 
 // --- SQLite backend ---------------------------------------------------------
@@ -204,19 +223,53 @@ impl SqliteAuthStore {
     fn init(conn: &Connection) -> Result<(), AuthError> {
         // ponytail: still no migration engine — the TOTP columns are added to the
         // CREATE TABLE, not ALTER-ed onto an existing table, so a dev db created
-        // before M4-TOTP must be recreated (delete chartcraft.db). Fine for the
-        // single-box dev/bootstrap deploy; a real migration runner is future work.
+        // before these columns existed must be recreated (delete chartcraft.db).
+        // Fine for the single-box dev/bootstrap deploy; a real migration runner is
+        // future work. M4 below turns the silent-mismatch failure mode into a clear
+        // fatal error at boot instead of a 500 at first login.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
-                 id            TEXT PRIMARY KEY,
-                 username      TEXT NOT NULL UNIQUE,
-                 display_name  TEXT NOT NULL,
-                 password_hash TEXT NOT NULL,
-                 totp_secret   TEXT NULL,
-                 totp_enabled  INTEGER NOT NULL DEFAULT 0,
-                 created       TEXT NOT NULL
+                 id                  TEXT PRIMARY KEY,
+                 username            TEXT NOT NULL UNIQUE,
+                 display_name        TEXT NOT NULL,
+                 password_hash       TEXT NOT NULL,
+                 totp_secret         TEXT NULL,
+                 totp_enabled        INTEGER NOT NULL DEFAULT 0,
+                 pending_totp_secret TEXT NULL,
+                 created             TEXT NOT NULL
              );",
         )?;
+
+        // M4: fail fast on an outdated schema. `CREATE TABLE IF NOT EXISTS` is a
+        // no-op against a pre-existing table, so a db made before a column was added
+        // would otherwise boot and only blow up (as a 500) when a query hits the
+        // missing column. Probe the live columns and demand the full expected set.
+        let present: std::collections::HashSet<String> = conn
+            .prepare("PRAGMA table_info(users)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?;
+        const EXPECTED: &[&str] = &[
+            "id",
+            "username",
+            "display_name",
+            "password_hash",
+            "totp_secret",
+            "totp_enabled",
+            "pending_totp_secret",
+            "created",
+        ];
+        let missing: Vec<&str> = EXPECTED
+            .iter()
+            .copied()
+            .filter(|c| !present.contains(*c))
+            .collect();
+        if !missing.is_empty() {
+            return Err(AuthError::Db(format!(
+                "users table schema is outdated (missing column(s): {}); \
+                 delete the database file and restart — no migration engine yet",
+                missing.join(", ")
+            )));
+        }
         Ok(())
     }
 }
@@ -259,7 +312,8 @@ impl AuthStore for SqliteAuthStore {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let rec = conn
             .query_row(
-                "SELECT id, username, display_name, password_hash, totp_secret, totp_enabled
+                "SELECT id, username, display_name, password_hash, totp_secret,
+                        totp_enabled, pending_totp_secret
                  FROM users WHERE username = ?1",
                 rusqlite::params![username],
                 |row| {
@@ -270,6 +324,7 @@ impl AuthStore for SqliteAuthStore {
                         password_hash: row.get(3)?,
                         totp_secret: row.get(4)?,
                         totp_enabled: row.get::<_, i64>(5)? != 0,
+                        pending_totp_secret: row.get(6)?,
                     })
                 },
             )
@@ -277,22 +332,40 @@ impl AuthStore for SqliteAuthStore {
         Ok(rec)
     }
 
-    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
+    fn set_pending_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "UPDATE users SET totp_secret = ?1 WHERE username = ?2",
+            "UPDATE users SET pending_totp_secret = ?1 WHERE username = ?2",
             rusqlite::params![secret_b32, username],
         )?;
         Ok(())
     }
 
-    fn enable_totp(&self, username: &str) -> Result<(), AuthError> {
+    fn promote_pending_totp(&self, username: &str) -> Result<bool, AuthError> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        conn.execute(
-            "UPDATE users SET totp_enabled = 1 WHERE username = ?1",
+        // One atomic statement: promote the pending secret to live, enable TOTP, and
+        // clear the pending slot. The `pending_totp_secret IS NOT NULL` guard makes
+        // "nothing to promote" a 0-row no-op rather than wiping a live secret.
+        let changed = conn.execute(
+            "UPDATE users
+                SET totp_secret = pending_totp_secret,
+                    totp_enabled = 1,
+                    pending_totp_secret = NULL
+              WHERE username = ?1 AND pending_totp_secret IS NOT NULL",
             rusqlite::params![username],
         )?;
-        Ok(())
+        Ok(changed > 0)
+    }
+
+    fn clear_totp(&self, username: &str) -> Result<bool, AuthError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let changed = conn.execute(
+            "UPDATE users
+                SET totp_secret = NULL, totp_enabled = 0, pending_totp_secret = NULL
+              WHERE username = ?1",
+            rusqlite::params![username],
+        )?;
+        Ok(changed > 0)
     }
 }
 
@@ -330,6 +403,7 @@ impl AuthStore for InMemoryAuthStore {
                 password_hash: password_hash.to_string(),
                 totp_secret: None,
                 totp_enabled: false,
+                pending_totp_secret: None,
             },
         );
         Ok(())
@@ -344,23 +418,44 @@ impl AuthStore for InMemoryAuthStore {
             password_hash: u.password_hash.clone(),
             totp_secret: u.totp_secret.clone(),
             totp_enabled: u.totp_enabled,
+            pending_totp_secret: u.pending_totp_secret.clone(),
         }))
     }
 
-    fn set_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
+    fn set_pending_totp_secret(&self, username: &str, secret_b32: &str) -> Result<(), AuthError> {
         let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = users.get_mut(username) {
-            u.totp_secret = Some(secret_b32.to_string());
+            u.pending_totp_secret = Some(secret_b32.to_string());
         }
         Ok(())
     }
 
-    fn enable_totp(&self, username: &str) -> Result<(), AuthError> {
+    fn promote_pending_totp(&self, username: &str) -> Result<bool, AuthError> {
         let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(u) = users.get_mut(username) {
-            u.totp_enabled = true;
+        match users.get_mut(username) {
+            Some(u) => match u.pending_totp_secret.take() {
+                Some(secret) => {
+                    u.totp_secret = Some(secret);
+                    u.totp_enabled = true;
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            None => Ok(false),
         }
-        Ok(())
+    }
+
+    fn clear_totp(&self, username: &str) -> Result<bool, AuthError> {
+        let mut users = self.users.lock().unwrap_or_else(|e| e.into_inner());
+        match users.get_mut(username) {
+            Some(u) => {
+                u.totp_secret = None;
+                u.totp_enabled = false;
+                u.pending_totp_secret = None;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
 
@@ -415,6 +510,16 @@ pub struct AuthState {
     // restart. Acceptable for a single-admin local deploy; revisit with IP-based
     // limiting + exponential backoff for a multi-user deployment.
     attempts: Mutex<HashMap<String, Attempts>>,
+    // N1: the last TOTP time-step this user successfully verified, per username.
+    // A verify is accepted only if its matched step is STRICTLY greater, so a code
+    // can't be replayed within its ~90 s validity window. Keyed by username and
+    // shared across the live and the pending secret (steps are wall-clock-derived,
+    // so they're directly comparable regardless of which secret matched).
+    //
+    // ponytail: in-memory, so a restart forgets the high-water mark and a code
+    // could be replayed once across a restart. Acceptable for a single-box deploy;
+    // a persisted used-step store is future work.
+    last_totp_step: Mutex<HashMap<String, u64>>,
 }
 
 impl AuthState {
@@ -423,6 +528,7 @@ impl AuthState {
             store,
             sessions: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
+            last_totp_step: Mutex::new(HashMap::new()),
         }
     }
 
@@ -579,19 +685,6 @@ impl AuthState {
         }
     }
 
-    /// Promote THIS session (by token) to `Full` — the confirm step. Idempotent;
-    /// a no-op if the token is unknown (e.g. already swept).
-    pub fn promote_session(&self, token: &str) {
-        if let Some(s) = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(token)
-        {
-            s.auth_level = AuthLevel::Full;
-        }
-    }
-
     /// Whether this user has confirmed TOTP (`totp_enabled`). Drives the
     /// `mfaEnrolled` field, read fresh from the store (it flips mid-session).
     pub fn mfa_enrolled(&self, username: &str) -> Result<bool, AuthError> {
@@ -602,21 +695,70 @@ impl AuthState {
             .unwrap_or(false))
     }
 
-    /// Enroll: generate a fresh TOTP secret for this user, store it (NOT enabled),
-    /// and return the artifacts the client needs — the `otpauth://` provisioning
-    /// URI, a base64-PNG QR of it, and the base32 secret for manual entry. The
-    /// secret is returned ONLY here and never logged. Re-enroll just regenerates.
+    /// Enroll (M1/M2): stage a TOTP secret in the PENDING slot and return the
+    /// artifacts the client needs — the `otpauth://` provisioning URI, a base64-PNG
+    /// QR of it, and the base32 secret for manual entry. The secret is returned
+    /// ONLY here and never logged.
     ///
-    /// ponytail: re-enroll on an ALREADY-enabled account hot-swaps the secret while
-    /// `totp_enabled` stays 1 — the next login then requires codes from the NEW
-    /// secret before the admin has scanned it, so a fat-fingered enroll can lock
-    /// future logins out. The contract explicitly permits a Full session to enroll,
-    /// so this is intended; a recovery / safe re-key UX (confirm-before-swap, or
-    /// backup codes) is future work.
-    pub fn totp_enroll(&self, username: &str) -> Result<TotpEnrollment, AuthError> {
-        let secret_b32 = Secret::generate().to_base32();
-        self.store.set_totp_secret(username, &secret_b32)?;
-        let totp = build_totp(&secret_b32, username).map_err(AuthError::Db)?;
+    /// Behavior depends on the user's current enrollment state:
+    /// - NOT yet enabled, and a pending secret already exists → return THAT SAME
+    ///   secret/URI/QR (idempotent: a reload must not rotate the secret and
+    ///   invalidate an already-scanned QR).
+    /// - NOT yet enabled, no pending secret → generate and stage a fresh one.
+    /// - ALREADY enabled (re-key) → REQUIRE re-authentication: `code` must be a
+    ///   valid LIVE TOTP code. If missing/invalid, return `Err(ReauthRequired)` and
+    ///   touch NO secret. On success, stage a NEW pending secret; the live secret
+    ///   keeps working until a confirm promotes the new one.
+    pub fn totp_enroll(&self, username: &str, code: &str) -> Result<TotpEnrollment, AuthError> {
+        self.totp_enroll_at(username, code, unix_now())
+    }
+
+    /// `totp_enroll` with an explicit unix "now" (seconds), so tests can drive the
+    /// clock across the TOTP window — the `_at` idiom the session/lockout code uses.
+    pub fn totp_enroll_at(
+        &self,
+        username: &str,
+        code: &str,
+        now: u64,
+    ) -> Result<TotpEnrollment, AuthError> {
+        let rec = self.store.find_by_username(username)?;
+        let (enabled, pending) = match &rec {
+            Some(u) => (u.totp_enabled, u.pending_totp_secret.clone()),
+            // Unknown user: no session could reach here for a missing user, but stay
+            // defensive — treat as a fresh (not-enabled, no-pending) enroll.
+            None => (false, None),
+        };
+
+        if enabled {
+            // Re-key path: require a current valid LIVE code before staging anything.
+            if !self.live_code_valid_consuming(username, code, now)? {
+                return Err(AuthError::ReauthRequired);
+            }
+            let secret_b32 = Secret::generate().to_base32();
+            self.store.set_pending_totp_secret(username, &secret_b32)?;
+            return self.enrollment_artifacts(&secret_b32, username);
+        }
+
+        // Not enabled: reuse an existing pending secret (idempotent reload) or mint
+        // a fresh one.
+        let secret_b32 = match pending {
+            Some(s) => s,
+            None => {
+                let s = Secret::generate().to_base32();
+                self.store.set_pending_totp_secret(username, &s)?;
+                s
+            }
+        };
+        self.enrollment_artifacts(&secret_b32, username)
+    }
+
+    /// Build the enroll response (URI + QR + secret) from a base32 secret.
+    fn enrollment_artifacts(
+        &self,
+        secret_b32: &str,
+        username: &str,
+    ) -> Result<TotpEnrollment, AuthError> {
+        let totp = build_totp(secret_b32, username).map_err(AuthError::Db)?;
         let otpauth_uri = totp
             .to_url()
             .map_err(|e| AuthError::Db(format!("totp url: {e}")))?;
@@ -626,38 +768,106 @@ impl AuthState {
         Ok(TotpEnrollment {
             otpauth_uri,
             qr_png_base64,
-            secret: secret_b32,
+            secret: secret_b32.to_string(),
         })
     }
 
-    /// Confirm: verify `code` against the user's stored (pending) secret with ±1
-    /// step skew. On success, flip `totp_enabled` on and return `true`. A missing
-    /// secret or a wrong code returns `false` (never a hint which).
+    /// Confirm (M1/M2 + N2): verify `code` against the user's PENDING secret with
+    /// ±1-step skew; on success ATOMICALLY promote it to the live secret (enabling
+    /// TOTP) and return `true`. A missing pending secret or a wrong code returns
+    /// `false` (never a hint which). N1 replay protection applies: a replayed step
+    /// is rejected as `false`.
     pub fn totp_confirm(&self, username: &str, code: &str) -> Result<bool, AuthError> {
-        if !self.totp_code_valid(username, code)? {
-            return Ok(false);
-        }
-        self.store.enable_totp(username)?;
-        Ok(true)
+        self.totp_confirm_at(username, code, unix_now())
     }
 
-    /// Verify a TOTP `code` against the user's stored secret (±1 step skew),
-    /// WITHOUT changing any state. Used by both confirm and login. A user with no
-    /// stored secret → `false`. Never logs the secret or the code.
+    /// `totp_confirm` with an explicit unix "now" (seconds), for deterministic tests.
+    pub fn totp_confirm_at(&self, username: &str, code: &str, now: u64) -> Result<bool, AuthError> {
+        if !self.pending_code_valid_consuming(username, code, now)? {
+            return Ok(false);
+        }
+        // Atomic promote: pending → live, enabled=1, pending cleared. The guard in
+        // the store makes a vanished pending secret a safe no-op (→ false).
+        self.store.promote_pending_totp(username)
+    }
+
+    /// M5 break-glass: clear ALL of a user's TOTP state so they re-enroll on next
+    /// login. Returns `Ok(true)` if the user existed and was cleared.
+    pub fn reset_mfa(&self, username: &str) -> Result<bool, AuthError> {
+        self.store.clear_totp(username)
+    }
+
+    /// Verify a TOTP `code` against the user's LIVE secret (login + re-key gate),
+    /// consuming the matched step for N1 replay protection. A user with no live
+    /// secret → `false`.
     pub fn totp_code_valid(&self, username: &str, code: &str) -> Result<bool, AuthError> {
-        let secret = match self.store.find_by_username(username)? {
-            Some(u) => u.totp_secret,
-            None => None,
-        };
+        self.live_code_valid_consuming(username, code, unix_now())
+    }
+
+    /// Verify `code` against the LIVE secret and consume its step (N1).
+    fn live_code_valid_consuming(
+        &self,
+        username: &str,
+        code: &str,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        let secret = self.store.find_by_username(username)?.and_then(|u| u.totp_secret);
+        self.code_matches_fresh_step(username, code, secret.as_deref(), now)
+    }
+
+    /// Verify `code` against the PENDING secret and consume its step (N1).
+    fn pending_code_valid_consuming(
+        &self,
+        username: &str,
+        code: &str,
+        now: u64,
+    ) -> Result<bool, AuthError> {
+        let secret = self
+            .store
+            .find_by_username(username)?
+            .and_then(|u| u.pending_totp_secret);
+        self.code_matches_fresh_step(username, code, secret.as_deref(), now)
+    }
+
+    /// Core N1 check: does `code` verify against `secret` at a step STRICTLY newer
+    /// than this user's last-accepted step? On a match at a fresh step, record it
+    /// and return `true`; a replay (step ≤ last-accepted) or any non-match → `false`.
+    /// A `None` secret → `false`. Never logs the secret or the code. `now` is unix
+    /// seconds (driven by callers / tests via the `_at` variants).
+    fn code_matches_fresh_step(
+        &self,
+        username: &str,
+        code: &str,
+        secret: Option<&str>,
+        now: u64,
+    ) -> Result<bool, AuthError> {
         let secret = match secret {
             Some(s) => s,
             None => return Ok(false),
         };
-        let totp = match build_totp(&secret, username) {
+        let totp = match build_totp(secret, username) {
             Ok(t) => t,
-            Err(_) => return Ok(false),
+            // M3: a corrupt stored secret must be DIAGNOSABLE, not look exactly like
+            // a wrong code. The error is already secret-free (build_totp never
+            // includes the secret), and we log neither the secret nor the code.
+            Err(e) => {
+                eprintln!("[chartcraft] TOTP build failed for a stored secret (user elided): {e}");
+                return Ok(false);
+            }
         };
-        Ok(totp.check_current(code).is_some())
+        let step = match totp.check(code, now) {
+            Some(s) => s,
+            None => return Ok(false),
+        };
+        // N1: reject a step we've already accepted for this user (replay window).
+        let mut steps = self.last_totp_step.lock().unwrap_or_else(|e| e.into_inner());
+        match steps.get(username) {
+            Some(&last) if step <= last => Ok(false),
+            _ => {
+                steps.insert(username.to_string(), step);
+                Ok(true)
+            }
+        }
     }
 
     /// MF-2: reclaim every expired session. Called on an interval by the
@@ -690,10 +900,9 @@ const TOTP_ISSUER: &str = "ChartCraft";
 /// Accepted clock skew in 30-second steps. 1 → the code for the previous OR next
 /// step also verifies (modest tolerance for client/server clock drift), no more.
 ///
-/// ponytail: verification is skew-tolerant but NOT replay-proof — a code stays
-/// valid for its whole ~90 s window and can be re-submitted within it. RFC 6238
-/// leaves single-use enforcement to the caller; a used-step cache is future work,
-/// out of scope for this milestone.
+/// N1: single-use is now enforced by the caller — every successful verify records
+/// the matched step in `last_totp_step` and rejects any step ≤ the last accepted,
+/// so a code can't be replayed within its validity window.
 const TOTP_SKEW: u16 = 1;
 
 /// What `/auth/totp/enroll` hands back to the client. The `secret` (base32) is
@@ -754,6 +963,15 @@ fn verify_password(password: &str, phc: &str) -> bool {
 fn dummy_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| hash_password("chartcraft-dummy-password-for-timing"))
+}
+
+/// Current unix time in seconds, for TOTP step derivation. Matches what totp-rs'
+/// own `*_current` helpers use (`SystemTime` since the epoch).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs()
 }
 
 /// A 256-bit cryptographically-random session token, hex-encoded (URL-safe). Hex
@@ -1083,6 +1301,84 @@ mod tests {
             totp: String::new(),
         });
         assert!(ok.is_ok(), "valid bootstrap registers");
+    }
+
+    /// Generate a code for a base32 secret at an explicit unix time, with the same
+    /// parameters the server builds with (issuer/account/skew).
+    fn code_at(secret_b32: &str, username: &str, at: u64) -> String {
+        build_totp(secret_b32, username).unwrap().generate(at).to_string()
+    }
+
+    /// M1/M2: a re-enroll by an enabled user stages a NEW secret and a confirm
+    /// atomically swaps it in — old code stops working, new code works. Driven on a
+    /// FIXED unix clock (`_at` variants) so four strictly-increasing steps don't
+    /// have to fit inside one real 30 s verification window.
+    #[test]
+    fn reenroll_confirm_atomically_swaps_secret_driven_clock() {
+        let state = AuthState::new(Box::new(InMemoryAuthStore::default()));
+        state
+            .register(&Credentials {
+                username: "admin".into(),
+                password: "a-long-enough-pw".into(),
+                display_name: "Admin".into(),
+                totp: String::new(),
+            })
+            .unwrap();
+
+        let t0: u64 = 1_700_000_000; // fixed epoch; +30 per step
+        let step = 30u64;
+
+        // Enroll (not yet enabled — no code needed) stages a pending secret...
+        let enroll = state.totp_enroll_at("admin", "", t0).unwrap();
+        let old_secret = enroll.secret.clone();
+        // ...and confirm at t0 promotes it to live (consumes step @ t0).
+        let confirm_code = code_at(&old_secret, "admin", t0);
+        assert!(state.totp_confirm_at("admin", &confirm_code, t0).unwrap());
+        assert!(state.mfa_enrolled("admin").unwrap());
+
+        // Re-enroll at t0+30 with a current LIVE code → stages a NEW pending secret.
+        let reauth = code_at(&old_secret, "admin", t0 + step);
+        let rekey = state.totp_enroll_at("admin", &reauth, t0 + step).unwrap();
+        let new_secret = rekey.secret.clone();
+        assert_ne!(new_secret, old_secret, "re-key stages a fresh secret");
+
+        // Confirm the NEW secret at t0+60 → atomic promote.
+        let new_confirm = code_at(&new_secret, "admin", t0 + 2 * step);
+        assert!(state.totp_confirm_at("admin", &new_confirm, t0 + 2 * step).unwrap());
+
+        // At t0+90: the OLD secret no longer verifies (swapped out)...
+        let old_code = code_at(&old_secret, "admin", t0 + 3 * step);
+        assert!(
+            !state.live_code_valid_consuming("admin", &old_code, t0 + 3 * step).unwrap(),
+            "old secret stops working after the atomic swap"
+        );
+        // ...and the NEW secret does.
+        let new_code = code_at(&new_secret, "admin", t0 + 3 * step);
+        assert!(
+            state.live_code_valid_consuming("admin", &new_code, t0 + 3 * step).unwrap(),
+            "new secret works after the atomic swap"
+        );
+    }
+
+    /// M4: `init` fails fast on a users table missing the expected columns, instead
+    /// of booting and 500-ing at first login.
+    #[test]
+    fn init_rejects_outdated_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        // An OLD schema: no `pending_totp_secret` column.
+        conn.execute_batch(
+            "CREATE TABLE users (
+                 id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                 display_name TEXT NOT NULL, password_hash TEXT NOT NULL,
+                 totp_secret TEXT NULL, totp_enabled INTEGER NOT NULL DEFAULT 0,
+                 created TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        let err = SqliteAuthStore::init(&conn).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("schema is outdated"), "clear outdated-schema error: {msg}");
+        assert!(msg.contains("pending_totp_secret"), "names the missing column: {msg}");
     }
 
     // N1: Secure flag is config-driven, tested without touching process env.

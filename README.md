@@ -2,7 +2,7 @@
 
 **An open-source electronic medical record, rebuilt in Rust, designed by a doctor who actually uses one.**
 
-Status: pre-alpha. A working FHIR core, a clinician UI, and an append-only, hash-chained (tamper-evident) audit log already exist (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). The remaining HIPAA safeguards — **authentication** and **encryption at rest** — are the *next* milestone (M4) and are **not built yet**. **Do not put real patient data in it today.** Use synthetic or de-identified data only until M4 lands. Contributors welcome from line one.
+Status: pre-alpha. A working FHIR core, a clinician UI, an append-only hash-chained (tamper-evident) audit log, and **authentication — password login with enforced TOTP two-factor (M4)** — all exist (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). The one remaining HIPAA technical safeguard is **encryption at rest**. **Until that lands, do not put real patient data in it** — use synthetic or de-identified data. Contributors welcome from line one.
 
 ---
 
@@ -21,9 +21,9 @@ ChartCraft is clinician-first, local-first, FHIR-native, and free.
 1. **Clinician-first, not biller-first.** The chart is for taking care of a patient. Billing is a *view* on the chart, generated from it, never the thing that shapes it.
 2. **FHIR-native from the first commit.** Not a proprietary schema with a FHIR export bolted on later. The data model *is* [FHIR R4](https://hl7.org/fhir/) + USCDI. Interop is the product, not a feature.
 3. **Local-first and self-hostable.** A solo physician runs it on one box. A clinic runs it on a server they own. Your patients' data is not rent you pay forever. Single Rust binary + Postgres (or SQLite for solo).
-4. **AI-native, clinician-in-the-loop.** The design intent: ambient scribe, structured extraction, order drafting, chart summarization — drafted by agents, *signed by a human*, with every AI action recorded as attributable, reversible `Provenance`. The AI surfaces and real human signing arrive with auth (M4); today a `Provenance` is written on every change but the signer is a placeholder.
+4. **AI-native, clinician-in-the-loop.** The design intent: ambient scribe, structured extraction, order drafting, chart summarization — drafted by agents, *signed by a human*, with every AI action recorded as attributable, reversible `Provenance`. Human signing is now real: the authenticated (password + TOTP) user is recorded as the signer on every change. The AI-drafting surfaces are still ahead.
 5. **Fast.** Rust, because a note should open in the time it takes to look up from the patient, not the time it takes to get coffee.
-6. **Auditable and private.** An append-only, hash-chained audit log already exists — altered or removed entries are detectable (`verify_audit_chain`), and every write commits its resource, `Provenance`, and `AuditEvent` atomically. The remaining safeguards, authentication and encryption at rest, are the current build focus (M4). No telemetry home (verified: loopback-only bind, same-origin UI).
+6. **Auditable and private.** An append-only, hash-chained audit log already exists — altered or removed entries are detectable (`verify_audit_chain`), and every write commits its resource, `Provenance`, and `AuditEvent` atomically. Authentication (password + enforced TOTP MFA) now gates every PHI endpoint, and the signer is the real logged-in user. The one remaining safeguard is encryption at rest. No telemetry home (verified: loopback-only bind, same-origin UI).
 
 ## The shape of the MVP
 
@@ -40,9 +40,19 @@ The wedge is the **note**. The thing a clinician actually fights the EMR over is
 
 ## What this is — and isn't — yet
 
-What it is *designed to be*: software a direct-pay physician can legally run as their own medical record. There is no federal law requiring an EMR to be *certified* for a clinician to document care in it; what applies is HIPAA and state record law. That legal path is open — but *legally permitted* is not the same as *technically ready*. The tamper-evident audit spine exists, but the remaining HIPAA technical safeguards (authentication, encryption at rest) are M4 and unbuilt, so ChartCraft is **not ready for real patient charts yet**. When those land, the first real user can be a physician signing their own charts.
+What it is *designed to be*: software a direct-pay physician can legally run as their own medical record. There is no federal law requiring an EMR to be *certified* for a clinician to document care in it; what applies is HIPAA and state record law. That legal path is open — but *legally permitted* is not the same as *technically ready*. The tamper-evident audit spine and authentication (password + enforced TOTP MFA) now exist; the one remaining HIPAA technical safeguard is encryption at rest. Until that lands, ChartCraft is **not ready for real patient charts**. When it does, the first real user can be a physician signing their own charts on localhost.
 
 What it isn't: ONC-certified. That certification is **voluntary** and gates CMS/MIPS participation and hospital procurement, not patient care itself. It is a months-long public process we climb in the open. See [`docs/REGULATORY.md`](docs/REGULATORY.md) for the two tiers.
+
+## Recovering a lost authenticator
+
+TOTP multi-factor is enforced: once enrolled, a user needs their authenticator app to log in. If that device is lost, an operator with filesystem access to the server can break-glass reset that user's MFA so they re-enroll on next login:
+
+```
+chartcraft --reset-mfa <username>
+```
+
+This clears the user's TOTP secret and enrollment state, prints a confirmation, and exits without starting the server. The user logs in with their password alone (landing a pending-MFA session) and is walked through enrollment again.
 
 ## Contributing
 
